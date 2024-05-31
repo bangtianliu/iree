@@ -30,6 +30,11 @@ namespace mlir::iree_compiler::Preprocessing {
 #define GEN_PASS_DEF_CONVERTCONVTOCHANNELSLASTPASS
 #include "iree/compiler/Preprocessing/Common/Passes.h.inc" // IWYU pragma: export
 
+static llvm::cl::opt<bool>
+    clEnableFHWCFitler("iree-preprocessing-enable-fhwc-filter-layout",
+                       llvm::cl::desc("Enable FHWC Filter Transpose."),
+                       llvm::cl::init(false));
+
 using ConvBuilderFn = std::function<Value(
     OpBuilder &b, Location loc, linalg::LinalgOp srcConv, Value input,
     Value filter, Value output, AffineMap inputMap, AffineMap filterMap,
@@ -332,6 +337,9 @@ transposeConvLikeLinalgOp(PatternRewriter &rewriter, linalg::LinalgOp convOp,
                           ConvBuilderFn convBuilder = defaultConvBuilderFn) {
   Location loc = convOp.getLoc();
 
+
+  // llvm::dbgs() << "DEBUG Inside " << enableFHWCFilter << "\t" << convOp << "\n";
+
   linalg::ConvolutionDimensions convDims;
   StringRef errString = getMatchConvolutionMessage(
       linalg::detail::isConvolutionInterfaceImpl(convOp, &convDims));
@@ -462,14 +470,21 @@ struct ConvertLinalgConvNchwFchw : OpRewritePattern<linalg::Conv2DNchwFchwOp> {
 
   LogicalResult matchAndRewrite(linalg::Conv2DNchwFchwOp convOp,
                                 PatternRewriter &rewriter) const override {
-    if (enableFHWCFilter)
-      return transposeConvLikeLinalgOp(
+    // bool hasAllOneStrides = llvm::all_of(convOp.getStrides(), [](APInt element) {
+    //       return element.getSExtValue() == 1;
+    //     });
+    // llvm::dbgs() << "STRIDE" << hasAllOneStrides << "\n"; 
+    auto strides = convOp.getStrides();
+    bool hasAllOneStrides = strides.isSplat() && strides.getSplatValue<int64_t>() == 1; 
+    // llvm::dbgs() << "STRIDE" << hasAllOneStrides << "\n"; 
+    if (enableFHWCFilter && hasAllOneStrides)
+        return transposeConvLikeLinalgOp(
           rewriter, convOp, /*tilingFactor=*/-1, enableFHWCFilter,
           namedConvBuilderFn<linalg::Conv2DNchwFchwOp,
                              linalg::Conv2DNhwcFhwcOp>);
     else
       return transposeConvLikeLinalgOp(
-          rewriter, convOp, /*tilingFactor=*/-1, enableFHWCFilter,
+          rewriter, convOp, /*tilingFactor=*/-1, false,
           namedConvBuilderFn<linalg::Conv2DNchwFchwOp,
                              linalg::Conv2DNhwcHwcfOp>);
   }
@@ -675,6 +690,11 @@ public:
     auto op = getOperation();
     MLIRContext *context = &getContext();
 
+    if (clEnableFHWCFitler)
+      enableFHWCFilter = true;
+
+    // llvm::dbgs() << "DEBUG " << enableFHWCFilter << "\n";
+    // llvm::dbgs() << "Op " << *op << "\n";
     // First pack/transpose all convolution like ops, trying to do a named op
     // to named op conversion if possible.
     {

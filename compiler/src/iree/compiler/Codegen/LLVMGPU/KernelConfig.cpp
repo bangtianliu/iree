@@ -1662,11 +1662,18 @@ static bool distributeToSquare(const int64_t oh, const int64_t ow,
 static LogicalResult setConvolutionConfig(linalg::LinalgOp linalgOp,
                                           const int64_t subgroupSize,
                                           const int64_t bestTilingFactor) {
-  if (!isa<linalg::Conv2DNhwcHwcfOp, linalg::Conv2DNchwFchwOp>(linalgOp)) {
+  // llvm::dbgs() << "SET Convolution Config " << "\n";                                            
+  if (!isa<linalg::Conv2DNhwcHwcfOp, linalg::Conv2DNchwFchwOp,
+           linalg::Conv2DNhwcFhwcOp>(linalgOp)) {
     return failure();
   }
   const bool isNCHW = isa<linalg::Conv2DNchwFchwOp>(*linalgOp);
-  const bool isNHWC = isa<linalg::Conv2DNhwcHwcfOp>(*linalgOp);
+  const bool isNHWC = isa<linalg::Conv2DNhwcHwcfOp>(*linalgOp) || isa<linalg::Conv2DNhwcFhwcOp>(*linalgOp);
+  // if (!isa<linalg::Conv2DNhwcHwcfOp, linalg::Conv2DNchwFchwOp>(linalgOp)) {
+  //   return failure();
+  // }
+  // const bool isNCHW = isa<linalg::Conv2DNchwFchwOp>(*linalgOp);
+  // const bool isNHWC = isa<linalg::Conv2DNhwcHwcfOp>(*linalgOp);
 
   const int ohIndex = isNHWC ? 1 : 2;
   const int owIndex = isNHWC ? 2 : 3;
