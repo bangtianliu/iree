@@ -8,6 +8,7 @@
 #define IREE_CODEGEN_LLVMGPU_PASSES
 
 include "mlir/Pass/PassBase.td"
+include "mlir/Dialect/LLVMIR/LLVMDialect.td"
 
 //------------------------------------------------------------------------------
 // LLVMGPU Passes (keep alphabetical)
@@ -136,6 +137,7 @@ def LLVMGPUVectorLowering :
     InterfacePass<"iree-llvmgpu-vector-lowering", "mlir::FunctionOpInterface"> {
   let summary = "Pass to lower Vector ops before conversion to LLVM.";
   let constructor = "mlir::iree_compiler::createLLVMGPUVectorLoweringPass()";
+  let dependentDialects = ["::mlir::LLVM::LLVMDialect"];
 }
 
 def LLVMGPUVectorToGPU :

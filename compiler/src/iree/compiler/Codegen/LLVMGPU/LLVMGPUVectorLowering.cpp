@@ -6,6 +6,7 @@
 
 #include "iree/compiler/Codegen/LLVMGPU/PassDetail.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
+#include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -28,6 +29,7 @@ struct LLVMGPUVectorLoweringPass
     registry.insert<memref::MemRefDialect>();
     registry.insert<vector::VectorDialect>();
     registry.insert<scf::SCFDialect>();
+    registry.insert<LLVM::LLVMDialect>();
   }
   void runOnOperation() override {
     auto funcOp = getOperation();
