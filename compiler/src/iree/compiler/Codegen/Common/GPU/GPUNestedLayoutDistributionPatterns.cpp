@@ -412,14 +412,13 @@ struct DistributeMultiReduction final
                                 PatternRewriter &rewriter) const override {
     VectorValue srcVector = multiReduceOp.getSource();
     auto accVector = dyn_cast<VectorValue>(multiReduceOp.getAcc());
-    if (!accVector) {
-      return rewriter.notifyMatchFailure(
-          multiReduceOp, "unimplemented: scalar accumulator distribution");
-    }
     auto resVector = dyn_cast<VectorValue>(multiReduceOp.getResult());
-    if (!resVector) {
-      return rewriter.notifyMatchFailure(
-          multiReduceOp, "unimplemented: scalar result distribution");
+    Type accType = multiReduceOp.getAcc().getType();
+    Type resType = multiReduceOp.getResult().getType();
+
+    if (!accType.isIntOrFloat() || !resType.isIntOrFloat()) {
+      return rewriter.notifyMatchFailure(multiReduceOp,
+                                         "unsupported reduction type");
     }
 
     auto srcLayout = dyn_cast_or_null<NestedLayoutAttr>(signature[srcVector]);
@@ -438,8 +437,17 @@ struct DistributeMultiReduction final
 
     VectorValue disSrc =
         getDistributed(rewriter, srcVector, signature[srcVector]);
-    VectorValue disAcc =
-        getDistributed(rewriter, accVector, signature[accVector]);
+
+    Value disAcc;
+    if (accVector) {
+      disAcc = getDistributed(rewriter, accVector, signature[accVector]);
+    } else {
+      disAcc = multiReduceOp.getAcc();
+    }
+
+    // llvm::dbgs() << "disAcc 1" << disAcc << "\n";
+    // VectorValue disAcc =
+    //     getDistributed(rewriter, accVector, signature[accVector]);
 
     Location loc = multiReduceOp.getLoc();
 
@@ -457,10 +465,20 @@ struct DistributeMultiReduction final
     }
     Value localInit = getCombiningIdentityValue(
         loc, rewriter, multiReduceOp.getKind(), disAcc.getType());
+    // llvm::dbgs() << "localInit " << localInit << "\n";
     auto localReduction = rewriter.create<vector::MultiDimReductionOp>(
         loc, disSrc, localInit, distributedReductionMask,
         multiReduceOp.getKind());
-    auto locallyReduced = dyn_cast<VectorValue>(localReduction.getResult());
+    // llvm::dbgs() << "localReduction " << localReduction << "\n";
+    VectorValue locallyReduced;
+    if (accVector) {
+      locallyReduced = dyn_cast<VectorValue>(localReduction.getResult());
+    } else {
+      VectorType vecType = VectorType::get(SmallVector<int64_t>{1}, elemTy);
+      locallyReduced = rewriter.create<vector::BroadcastOp>(
+          loc, vecType, localReduction.getResult());
+    }
+    // auto locallyReduced = dyn_cast<VectorValue>(localReduction.getResult());
 
     assert(locallyReduced && "result should have been a vector");
 
@@ -483,15 +501,30 @@ struct DistributeMultiReduction final
     // reduction.
     VectorValue unflattened = rewriter.create<vector::ShapeCastOp>(
         loc, shaped, threadReduced.value());
+    // llvm::dbgs() << "disAcc" << disAcc << "\n";
+    // llvm::dbgs() << "unflattened" << unflattened << "\n";
+    if (!accVector) {
+      disAcc = rewriter.create<vector::BroadcastOp>(loc, shaped, disAcc);
+    }
+
     Value accReduction = vector::makeArithReduction(
         rewriter, loc, multiReduceOp.getKind(), unflattened, disAcc);
+
+    // llvm::dbgs() << "accReduction" << accReduction << "\n";
     auto accReduced = dyn_cast<VectorValue>(accReduction);
     if (!accReduced) {
       return failure();
     }
-    replaceOpWithDistributedValues(rewriter, multiReduceOp, accReduced);
 
-    return failure();
+    if (resVector) {
+      replaceOpWithDistributedValues(rewriter, multiReduceOp, accReduced);
+    } else {
+      Value accReducedVal = rewriter.create<vector::ExtractOp>(
+          loc, accReduction, SmallVector<int64_t>{0});
+      replaceOpWithDistributedValues(rewriter, multiReduceOp, accReducedVal);
+    }
+
+    return success();
   }
 
   FailureOr<VectorValue> doThreadReduction(RewriterBase &rewriter,
