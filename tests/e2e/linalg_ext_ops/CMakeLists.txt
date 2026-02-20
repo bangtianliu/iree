@@ -15,6 +15,7 @@ iree_check_single_backend_test_suite(
     check_llvm-cpu_local-task
   SRCS
     "arg_compare.mlir"
+    "arg_compare_gpu.mlir"
     "attention.mlir"
     "attention_i1_mask.mlir"
     "gather.mlir"
@@ -62,6 +63,7 @@ iree_check_single_backend_test_suite(
     check_cuda
   SRCS
     "arg_compare.mlir"
+    "arg_compare_gpu.mlir"
     "gather.mlir"
     "scan.mlir"
     "scatter.mlir"
@@ -86,6 +88,7 @@ iree_check_single_backend_test_suite(
     check_rocm_hip
   SRCS
     "arg_compare.mlir"
+    "arg_compare_gpu.mlir"
     "attention.mlir"
     "gather.mlir"
     "map_gather.mlir"

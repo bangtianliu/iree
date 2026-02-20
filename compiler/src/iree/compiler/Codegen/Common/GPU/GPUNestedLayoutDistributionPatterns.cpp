@@ -22,6 +22,9 @@
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/Utils/GPUUtils.h"
+#include "mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Utils/VectorUtils.h"
@@ -305,8 +308,15 @@ struct DistributeTransferRead final
                                 DistributionSignature &signature,
                                 PatternRewriter &rewriter) const override {
 
+    // Skip 0-D vectors (scalars) - they don't need distribution
+    auto resultVector = readOp.getResult();
+    if (!isNonZeroRank(resultVector)) {
+      return rewriter.notifyMatchFailure(readOp,
+                                         "0-D vector (scalar) doesn't need distribution");
+    }
+
     NestedLayoutAttr vectorLayout =
-        dyn_cast<NestedLayoutAttr>(signature[readOp.getResult()]);
+        dyn_cast<NestedLayoutAttr>(signature[resultVector]);
     if (!vectorLayout) {
       return rewriter.notifyMatchFailure(readOp,
                                          "non-nested transfer_read layout");
@@ -484,8 +494,17 @@ struct DistributeTransferWrite final
   LogicalResult matchAndRewrite(vector::TransferWriteOp writeOp,
                                 DistributionSignature &signature,
                                 PatternRewriter &rewriter) const override {
+    // Skip 0-D vectors (scalars) - they don't need distribution
+    auto valueToStore = writeOp.getValueToStore();
+    if (auto vecValue = dyn_cast<VectorValue>(valueToStore)) {
+      if (!isNonZeroRank(vecValue)) {
+        return rewriter.notifyMatchFailure(writeOp,
+                                           "0-D vector (scalar) doesn't need distribution");
+      }
+    }
+
     NestedLayoutAttr vectorLayout =
-        dyn_cast<NestedLayoutAttr>(signature[writeOp.getValueToStore()]);
+        dyn_cast<NestedLayoutAttr>(signature[cast<VectorValue>(valueToStore)]);
     if (!vectorLayout) {
       return rewriter.notifyMatchFailure(writeOp,
                                          "non-nested transfer_write layout");
@@ -915,7 +934,7 @@ struct DistributeBroadcast final : OpDistributionPattern<vector::BroadcastOp> {
     }
 
     Value distSource = broadcastOp.getSource();
-    if (srcVector) {
+    if (srcVector && isNonZeroRank(srcVector)) {
       auto sourceLayout = dyn_cast<NestedLayoutAttr>(signature[srcVector]);
       if (!sourceLayout) {
         return rewriter.notifyMatchFailure(broadcastOp,
@@ -923,6 +942,7 @@ struct DistributeBroadcast final : OpDistributionPattern<vector::BroadcastOp> {
       }
       distSource = getDistributed(rewriter, srcVector, sourceLayout);
     }
+    // 0-D vectors (scalars) don't need distribution - use as-is
     VectorValue broadcasted =
         broadcastToShape(rewriter, distSource, distShape, broadcastedDims);
     replaceOpWithDistributedValues(rewriter, broadcastOp, broadcasted);
@@ -2321,6 +2341,995 @@ struct DistributeInnerTiled final
   }
 };
 
+/// Lowering for arg_compare operations.
+/// This pattern distributes iree_vector_ext.arg_compare operations across threads.
+/// Unlike standard reductions, arg_compare tracks both a value and an index,
+/// requiring simultaneous reduction of two vectors with comparator-based selection.
+struct DistributeArgCompare final
+    : OpDistributionPattern<IREE::VectorExt::ArgCompareOp> {
+  using OpDistributionPattern::OpDistributionPattern;
+
+  DistributeArgCompare(MLIRContext *context, int64_t subgroupSize,
+                       int64_t maxBitsPerShuffle, int64_t benefit = 1)
+      : OpDistributionPattern(context, benefit),
+        subgroupSize(subgroupSize), maxBitsPerShuffle(maxBitsPerShuffle) {}
+
+  LogicalResult matchAndRewrite(IREE::VectorExt::ArgCompareOp argCompareOp,
+                                DistributionSignature &signature,
+                                PatternRewriter &rewriter) const override {
+    Location loc = argCompareOp.getLoc();
+
+    // Extract input value and its layout
+    VectorValue inputVal = argCompareOp.getInputValue();
+
+    auto inputLayout = dyn_cast_if_present<NestedLayoutAttr>(signature[inputVal]);
+    if (!inputLayout) {
+      return rewriter.notifyMatchFailure(argCompareOp,
+                                         "expected nested layout attr for input");
+    }
+
+    // Check element bitwidth
+    Type elemTy = inputVal.getType().getElementType();
+    unsigned elemBitwidth = elemTy.getIntOrFloatBitWidth();
+    if (elemBitwidth > maxBitsPerShuffle) {
+      return rewriter.notifyMatchFailure(
+          argCompareOp,
+          llvm::formatv("element bitwidth {0} greater than maxBitsPerShuffle {1}",
+                        elemBitwidth, maxBitsPerShuffle));
+    }
+
+    // Get distributed inputs
+    VectorValue disInputVal = getDistributed(rewriter, inputVal, signature[inputVal]);
+
+    // Handle optional input_index (explicit-index mode)
+    Value disInputIdx = nullptr;
+    if (Value inputIdx = argCompareOp.getInputIndex()) {
+      VectorValue inputIdxVec = cast<VectorValue>(inputIdx);
+      disInputIdx = getDistributed(rewriter, inputIdxVec, signature[inputIdxVec]);
+    }
+
+    // Get init vectors
+    // Note: init values can be 0-D vectors (scalars) which don't need distribution
+    VectorValue initVal = argCompareOp.getInitValue();
+    VectorValue initIdx = argCompareOp.getInitIndex();
+
+    // Check if init values are non-zero rank (need distribution)
+    // 0-D vectors are scalars and are "always distributed to all threads already"
+    VectorValue disInitVal;
+    VectorValue disInitIdx;
+    if (isNonZeroRank(initVal)) {
+      // Regular vector - distribute it
+      disInitVal = getDistributed(rewriter, initVal, signature[initVal]);
+    } else {
+      // 0-D vector (scalar) - use as-is, no distribution needed
+      disInitVal = initVal;
+    }
+
+    if (isNonZeroRank(initIdx)) {
+      // Regular vector - distribute it
+      disInitIdx = getDistributed(rewriter, initIdx, signature[initIdx]);
+    } else {
+      // 0-D vector (scalar) - use as-is, no distribution needed
+      disInitIdx = initIdx;
+    }
+
+    // Get the reduction dimension
+    int64_t reductionDim = argCompareOp.getDimension();
+
+    // Create reduction mask (true for the reduction dimension)
+    int64_t rank = inputVal.getType().getRank();
+    SmallVector<bool> reducedDims(rank, false);
+    reducedDims[reductionDim] = true;
+
+    // Step 1: Local reduction across batch/outer/element dims
+    // For arg_compare, we need to apply the comparator to do local reduction
+    // The distributed reduction mask is the same mask appended thrice (batch, outer, element)
+    SmallVector<bool> distributedReductionMask;
+    distributedReductionMask.reserve(3 * rank);
+    for (int i = 0; i < 3; ++i) {
+      distributedReductionMask.append(reducedDims.begin(), reducedDims.end());
+    }
+
+    // For the local reduction, init values must have rank = input_rank - 1.
+    // After distribution, both input and init have different ranks, so we need
+    // to broadcast init to match: distributed_init_rank = distributed_input_rank - 1.
+    VectorValue localInitVal = disInitVal;
+    VectorValue localInitIdx = disInitIdx;
+
+    auto distInputShape = disInputVal.getType().getShape();
+    int64_t distInputRank = distInputShape.size();
+    int64_t expectedInitRank = distInputRank - 1;
+    int64_t actualInitRank = disInitVal.getType().getRank();
+
+    if (actualInitRank != expectedInitRank && expectedInitRank > 0) {
+      // Create shape for init: remove the reduction dimension from input shape
+      SmallVector<int64_t> initShape(distInputShape.begin(), distInputShape.end());
+      // The reduction dimension in distributed space may be different. For a
+      // 2D layout distributed to 6D (batch[2], outer[2], thread[2]), the original
+      // reduction dim 1 becomes dimension 1, 3, 5 (batch[1], outer[1], thread[1]).
+      // We remove the first occurrence (batch dimension).
+      initShape.erase(initShape.begin() + reductionDim);
+
+      // Broadcast/shape_cast to the expected shape
+      auto initValVecType = VectorType::get(initShape, disInitVal.getType().getElementType());
+      if (actualInitRank == 0) {
+        // 0-D scalar: broadcast to target shape
+        auto broadcastVal = vector::BroadcastOp::create(
+            rewriter, loc, initValVecType, disInitVal);
+        localInitVal = broadcastVal.getResult();
+      } else {
+        // Non-0D but wrong rank: use shape_cast
+        // This handles the case where distributed init has fewer dims than expected
+        localInitVal = vector::ShapeCastOp::create(
+            rewriter, loc, initValVecType, disInitVal);
+      }
+
+      auto initIdxVecType = VectorType::get(initShape, disInitIdx.getType().getElementType());
+      if (actualInitRank == 0) {
+        auto broadcastIdx = vector::BroadcastOp::create(
+            rewriter, loc, initIdxVecType, disInitIdx);
+        localInitIdx = broadcastIdx.getResult();
+      } else {
+        localInitIdx = vector::ShapeCastOp::create(
+            rewriter, loc, initIdxVecType, disInitIdx);
+      }
+    }
+
+    // For element_tile=1, local reduction is trivial - each thread has one element
+    // For element_tile>1, we need to reduce the local elements within each thread
+    int64_t elementTile = inputLayout.getElementTile()[reductionDim];
+
+    VectorValue locallyReducedVal;
+    VectorValue locallyReducedIdx;
+
+    if (elementTile == 1) {
+      // No local reduction needed - each thread has exactly one element
+      // Just use the distributed inputs directly
+      locallyReducedVal = disInputVal;
+      locallyReducedIdx = cast<VectorValue>(disInputIdx);
+    } else {
+      // element_tile > 1: reduce within each thread's elements
+      // Use doLocalArgCompareReduction to reduce the element dimension
+      auto localReduced = doLocalArgCompareReduction(
+          rewriter, loc, disInputVal, cast<VectorValue>(disInputIdx),
+          argCompareOp.getRegion(), elementTile, reductionDim, inputLayout);
+
+      if (failed(localReduced)) {
+        return rewriter.notifyMatchFailure(
+            argCompareOp,
+            "failed to perform local element reduction for arg_compare");
+      }
+
+      locallyReducedVal = localReduced->first;
+      locallyReducedIdx = localReduced->second;
+    }
+
+    // Step 2: Thread-level reduction
+    bool hasThreadReductions =
+        inputLayout.getThreadTile()[reductionDim] > 1;
+    bool hasSubgroupReductions =
+        inputLayout.getSubgroupTile()[reductionDim] > 1;
+
+    VectorValue threadReducedVal = locallyReducedVal;
+    VectorValue threadReducedIdx = locallyReducedIdx;
+
+    if (hasThreadReductions) {
+      // Flatten the vectors for thread reduction
+      VectorType valShape = locallyReducedVal.getType();
+      VectorType idxShape = locallyReducedIdx.getType();
+      int64_t numElements = valShape.getNumElements();
+
+      SmallVector<int64_t> flatShape(1, numElements);
+      VectorType flatValType = VectorType::get(flatShape, valShape.getElementType());
+      VectorType flatIdxType = VectorType::get(flatShape, idxShape.getElementType());
+
+      VectorValue flatVal = vector::ShapeCastOp::create(
+          rewriter, loc, flatValType, locallyReducedVal);
+      VectorValue flatIdx = vector::ShapeCastOp::create(
+          rewriter, loc, flatIdxType, locallyReducedIdx);
+
+      // Do inter-thread reduction using butterfly shuffles
+      auto threadReduced = doArgCompareThreadReduction(
+          rewriter, inputLayout, flatVal, flatIdx,
+          argCompareOp.getRegion(), reducedDims);
+
+      if (failed(threadReduced)) {
+        return failure();
+      }
+
+      // Reshape back to original shape
+      threadReducedVal = vector::ShapeCastOp::create(
+          rewriter, loc, valShape, threadReduced->first);
+      threadReducedIdx = vector::ShapeCastOp::create(
+          rewriter, loc, idxShape, threadReduced->second);
+    }
+
+    // Step 3: Subgroup-level reduction
+    if (hasSubgroupReductions) {
+      // Get result layouts
+      // Note: Results are 0-D vectors (scalars) so they won't have layouts in signature
+      // Results are always 0-D vectors for reductions, create empty layout
+      // 0-D vectors have rank 0, so all tile sizes are empty
+      auto emptyLayout = NestedLayoutAttr::get(
+          rewriter.getContext(),
+          /*subgroupTile=*/{}, /*batchTile=*/{}, /*outerTile=*/{},
+          /*threadTile=*/{}, /*elementTile=*/{},
+          /*subgroupStrides=*/{}, /*threadStrides=*/{});
+      VectorLayoutInterface resValLayout = emptyLayout;
+      VectorLayoutInterface resIdxLayout = emptyLayout;
+
+      // Perform cross-subgroup reduction via shared memory
+      auto subgroupReduced = doArgCompareSubgroupReduction(
+          rewriter, loc, inputVal, argCompareOp.getInitIndex(),
+          inputLayout, reductionDim,
+          threadReducedVal, threadReducedIdx,
+          argCompareOp.getRegion(), resValLayout, resIdxLayout);
+
+      SmallVector<Value> results = {subgroupReduced.first, subgroupReduced.second};
+      replaceOpWithDistributedValues(rewriter, argCompareOp, results);
+      return success();
+    }
+
+    // Replace with the reduced results
+    SmallVector<Value> results = {threadReducedVal, threadReducedIdx};
+    replaceOpWithDistributedValues(rewriter, argCompareOp, results);
+    return success();
+  }
+
+  // Helper to perform local element-wise reduction for arg_compare.
+  // This reduces multiple elements within each thread (when element_tile > 1).
+  // For example, if each thread holds 4 elements, this reduces them to 1 element.
+  //
+  // The distributed input has shape [batch, outer, element] where element is the
+  // element_tile dimension. We reduce along the element dimension.
+  //
+  // Returns a pair of (val, idx) vectors with the element dimension reduced to 1.
+  FailureOr<std::pair<VectorValue, VectorValue>>
+  doLocalArgCompareReduction(RewriterBase &rewriter, Location loc,
+                             VectorValue inputVal, VectorValue inputIdx,
+                             Region &comparatorRegion,
+                             int64_t elementTile, int64_t reductionDim,
+                             NestedLayoutAttr layout) const {
+    VectorType valType = inputVal.getType();
+    VectorType idxType = inputIdx.getType();
+
+    int64_t rank = valType.getRank();
+    SmallVector<int64_t> shape(valType.getShape());
+
+    // Find the element dimension in the distributed shape.
+    // The distributed shape is: [batch[0], ..., batch[n-1], outer[0], ..., outer[n-1],
+    //                           element[0], ..., element[n-1]]
+    // where n is the original rank.
+    // For reductionDim, the element dimension is at position: 2*originalRank + reductionDim
+    int64_t originalRank = layout.getSubgroupTile().size();
+    int64_t elementDimInDist = 2 * originalRank + reductionDim;
+
+    // If the distributed shape doesn't have enough dimensions, fall back to
+    // reducing the last dimension
+    if (elementDimInDist >= rank) {
+      elementDimInDist = rank - 1;
+    }
+
+    int64_t numElements = shape[elementDimInDist];
+    if (numElements <= 1) {
+      // Nothing to reduce locally
+      return std::make_pair(inputVal, inputIdx);
+    }
+
+    // Create output shape by setting the reduction dimension to 1
+    SmallVector<int64_t> outputShape = shape;
+    outputShape[elementDimInDist] = 1;
+
+    // Initialize accumulators with the first element
+    SmallVector<int64_t> extractIndices(rank, 0);
+    Value accVal = vector::ExtractOp::create(
+        rewriter, loc, inputVal, extractIndices);
+    Value accIdx = vector::ExtractOp::create(
+        rewriter, loc, inputIdx, extractIndices);
+
+    // Sequential reduction: compare each element with accumulator
+    for (int64_t i = 1; i < numElements; ++i) {
+      // Extract element i
+      SmallVector<int64_t> indices(rank, 0);
+      indices[elementDimInDist] = i;
+      Value elemVal = vector::ExtractOp::create(rewriter, loc, inputVal, indices);
+      Value elemIdx = vector::ExtractOp::create(rewriter, loc, inputIdx, indices);
+
+      // Apply comparator: compare(accVal, elemVal)
+      // Returns true if accVal should win (e.g., accVal > elemVal for argmax)
+      Block *comparatorBlock = &comparatorRegion.front();
+      IRMapping mapping;
+      mapping.map(comparatorBlock->getArgument(0), accVal);
+      mapping.map(comparatorBlock->getArgument(1), elemVal);
+
+      Value cmpResult;
+      for (Operation &op : comparatorBlock->getOperations()) {
+        if (auto yieldOp = dyn_cast<IREE::VectorExt::YieldOp>(op)) {
+          cmpResult = mapping.lookup(yieldOp.getValues()[0]);
+          break;
+        }
+        rewriter.clone(op, mapping);
+      }
+
+      if (!cmpResult) {
+        return failure();
+      }
+
+      // For ties (accVal == elemVal), prefer the smaller index
+      Value tieCondition;
+      if (isa<FloatType>(accVal.getType())) {
+        tieCondition = arith::CmpFOp::create(
+            rewriter, loc, arith::CmpFPredicate::OEQ, accVal, elemVal);
+      } else {
+        tieCondition = arith::CmpIOp::create(
+            rewriter, loc, arith::CmpIPredicate::eq, accVal, elemVal);
+      }
+
+      // elemIdx < accIdx (prefer smaller index on tie)
+      Value idxLess = arith::CmpIOp::create(
+          rewriter, loc, arith::CmpIPredicate::slt, elemIdx, accIdx);
+
+      // preferElem = !cmpResult || (tie && elemIdx < accIdx)
+      // i.e., prefer new element if:
+      //   - accumulator doesn't win (!cmpResult), OR
+      //   - it's a tie and new element has smaller index
+      Value notAccWins = arith::XOrIOp::create(
+          rewriter, loc, cmpResult,
+          arith::ConstantOp::create(rewriter, loc, rewriter.getBoolAttr(true)));
+      Value tieAndSmaller = arith::AndIOp::create(
+          rewriter, loc, tieCondition, idxLess);
+      Value preferElem = arith::OrIOp::create(
+          rewriter, loc, notAccWins, tieAndSmaller);
+
+      // Update accumulator
+      accVal = arith::SelectOp::create(rewriter, loc, preferElem, elemVal, accVal);
+      accIdx = arith::SelectOp::create(rewriter, loc, preferElem, elemIdx, accIdx);
+    }
+
+    // Create output vectors with the reduced values
+    // We need to insert the scalar into a vector of shape outputShape
+    // Since outputShape has the element dim = 1, we can use vector.from_elements
+    // or insert at index 0.
+    VectorType outputValType = VectorType::get(outputShape, valType.getElementType());
+    VectorType outputIdxType = VectorType::get(outputShape, idxType.getElementType());
+
+    // Create zero-initialized vectors and insert the reduced value at position 0
+    auto zeroVal = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getZeroAttr(outputValType));
+    auto zeroIdx = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getZeroAttr(outputIdxType));
+
+    SmallVector<int64_t> insertPos(rank, 0);
+    Value resultVal = vector::InsertOp::create(
+        rewriter, loc, accVal, zeroVal, insertPos);
+    Value resultIdx = vector::InsertOp::create(
+        rewriter, loc, accIdx, zeroIdx, insertPos);
+
+    return std::make_pair(cast<VectorValue>(resultVal),
+                          cast<VectorValue>(resultIdx));
+  }
+
+  // Analyze a comparator region to determine the corresponding GPU reduce
+  // operation. The comparator must be a SIMPLE comparison - just a cmpf/cmpi
+  // directly on the block arguments, followed by a yield.
+  //
+  // Returns std::nullopt if:
+  // - The comparator has more than 2 operations (cmp + yield)
+  // - The comparison operands are not the block arguments directly
+  // - The comparison predicate doesn't map to max/min
+  //
+  // This ensures we only use SubgroupReduceOp for truly simple comparators
+  // like `cmpf ogt %arg0, %arg1` and not for complex ones like
+  // `cmpf ogt (absf %arg0), (absf %arg1)`.
+  std::optional<gpu::AllReduceOperation>
+  getReduceOpFromComparator(Region &comparatorRegion, Type elemType) const {
+    Block *block = &comparatorRegion.front();
+
+    // Count operations - should be exactly 2 (cmp + yield)
+    size_t opCount = 0;
+    for (Operation &op : block->getOperations()) {
+      (void)op;
+      ++opCount;
+    }
+    if (opCount != 2) {
+      // Complex comparator with additional operations - use fallback
+      return std::nullopt;
+    }
+
+    // Get block arguments
+    if (block->getNumArguments() != 2) {
+      return std::nullopt;
+    }
+    Value arg0 = block->getArgument(0);
+    Value arg1 = block->getArgument(1);
+
+    // Look for the comparison operation in the comparator block
+    for (Operation &op : block->getOperations()) {
+      if (auto cmpfOp = dyn_cast<arith::CmpFOp>(op)) {
+        // Verify the comparison is directly on the block arguments
+        if (cmpfOp.getLhs() != arg0 || cmpfOp.getRhs() != arg1) {
+          // Operands are not the block arguments - complex comparator
+          return std::nullopt;
+        }
+
+        // For floating-point comparisons:
+        // OGT (ordered greater than) -> argmax -> need MAXIMUMF
+        // OLT (ordered less than) -> argmin -> need MINIMUMF
+        switch (cmpfOp.getPredicate()) {
+        case arith::CmpFPredicate::OGT:
+        case arith::CmpFPredicate::OGE:
+        case arith::CmpFPredicate::UGT:
+        case arith::CmpFPredicate::UGE:
+          return gpu::AllReduceOperation::MAXIMUMF;
+        case arith::CmpFPredicate::OLT:
+        case arith::CmpFPredicate::OLE:
+        case arith::CmpFPredicate::ULT:
+        case arith::CmpFPredicate::ULE:
+          return gpu::AllReduceOperation::MINIMUMF;
+        default:
+          return std::nullopt;
+        }
+      } else if (auto cmpiOp = dyn_cast<arith::CmpIOp>(op)) {
+        // Verify the comparison is directly on the block arguments
+        if (cmpiOp.getLhs() != arg0 || cmpiOp.getRhs() != arg1) {
+          // Operands are not the block arguments - complex comparator
+          return std::nullopt;
+        }
+
+        // For integer comparisons:
+        // sgt/sge (signed greater) -> argmax -> need MAXSI
+        // slt/sle (signed less) -> argmin -> need MINSI
+        // ugt/uge (unsigned greater) -> argmax -> need MAXUI
+        // ult/ule (unsigned less) -> argmin -> need MINUI
+        switch (cmpiOp.getPredicate()) {
+        case arith::CmpIPredicate::sgt:
+        case arith::CmpIPredicate::sge:
+          return gpu::AllReduceOperation::MAXSI;
+        case arith::CmpIPredicate::slt:
+        case arith::CmpIPredicate::sle:
+          return gpu::AllReduceOperation::MINSI;
+        case arith::CmpIPredicate::ugt:
+        case arith::CmpIPredicate::uge:
+          return gpu::AllReduceOperation::MAXUI;
+        case arith::CmpIPredicate::ult:
+        case arith::CmpIPredicate::ule:
+          return gpu::AllReduceOperation::MINUI;
+        default:
+          return std::nullopt;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  // Create a DPP operation that performs the same data exchange as
+  // gpu::ShuffleOp with XOR mode for the given offset.
+  // Returns nullptr if the offset is not supported.
+  //
+  // XOR Shuffle to DPP Mapping:
+  //   XOR 1:  quad_perm{1,0,3,2} - swap adjacent pairs
+  //   XOR 2:  quad_perm{2,3,0,1} - swap quad halves
+  //   XOR 4:  row_half_mirror   - reverse within 8-lane half-rows
+  //   XOR 8:  row_mirror        - reverse within 16-lane rows
+  //   XOR 16: row_bcast_15      - cross-row broadcast (with row_mask=0xa)
+  //   XOR 32: row_bcast_31      - cross half-wave broadcast
+  Value createDPPShuffleXOR(RewriterBase &rewriter, Location loc, Value src,
+                            int64_t xorOffset) const {
+    constexpr int allRows = 0xf;
+    constexpr int allBanks = 0xf;
+
+    switch (xorOffset) {
+    case 1:
+      return amdgpu::DPPOp::create(
+          rewriter, loc, src.getType(), /*old=*/src, /*src=*/src,
+          amdgpu::DPPPerm::quad_perm,
+          /*permArgument=*/rewriter.getI32ArrayAttr({1, 0, 3, 2}),
+          /*row_mask=*/allRows, /*bank_mask=*/allBanks, /*bound_ctrl=*/true);
+    case 2:
+      return amdgpu::DPPOp::create(
+          rewriter, loc, src.getType(), /*old=*/src, /*src=*/src,
+          amdgpu::DPPPerm::quad_perm,
+          /*permArgument=*/rewriter.getI32ArrayAttr({2, 3, 0, 1}),
+          /*row_mask=*/allRows, /*bank_mask=*/allBanks, /*bound_ctrl=*/true);
+    case 4:
+      return amdgpu::DPPOp::create(
+          rewriter, loc, src.getType(), /*old=*/src, /*src=*/src,
+          amdgpu::DPPPerm::row_half_mirror,
+          /*permArgument=*/rewriter.getUnitAttr(),
+          /*row_mask=*/allRows, /*bank_mask=*/allBanks, /*bound_ctrl=*/true);
+    case 8:
+      return amdgpu::DPPOp::create(
+          rewriter, loc, src.getType(), /*old=*/src, /*src=*/src,
+          amdgpu::DPPPerm::row_mirror,
+          /*permArgument=*/rewriter.getUnitAttr(),
+          /*row_mask=*/allRows, /*bank_mask=*/allBanks, /*bound_ctrl=*/true);
+    case 16:
+      // For XOR 16: use row_bcast_15 with row_mask=0xa.
+      // row_bcast_15 broadcasts lane 15 of each row to the next row.
+      // row_mask=0xa (binary 1010) selects rows 1 and 3 for writing,
+      // which achieves the lane XOR 16 pattern.
+      return amdgpu::DPPOp::create(
+          rewriter, loc, src.getType(), /*old=*/src, /*src=*/src,
+          amdgpu::DPPPerm::row_bcast_15,
+          /*permArgument=*/rewriter.getUnitAttr(),
+          /*row_mask=*/0xa, /*bank_mask=*/allBanks, /*bound_ctrl=*/false);
+    case 32:
+      return amdgpu::DPPOp::create(
+          rewriter, loc, src.getType(), /*old=*/src, /*src=*/src,
+          amdgpu::DPPPerm::row_bcast_31,
+          /*permArgument=*/rewriter.getUnitAttr(),
+          /*row_mask=*/allRows, /*bank_mask=*/allBanks, /*bound_ctrl=*/true);
+    default:
+      // Fall back to nullptr for unsupported offsets
+      return nullptr;
+    }
+  }
+
+  // Helper to perform thread-level reduction for arg_compare.
+  // Unlike standard reductions, this must maintain both value and index vectors.
+  //
+  // This implementation uses gpu::SubgroupReduceOp for the value reduction,
+  // which enables DPP optimizations on AMD GPUs. After getting the reduced
+  // value, it uses ballot + cttz to find the winning thread and shuffles
+  // the index from that thread.
+  FailureOr<std::pair<VectorValue, VectorValue>>
+  doArgCompareThreadReduction(RewriterBase &rewriter, NestedLayoutAttr layout,
+                              VectorValue flatVal, VectorValue flatIdx,
+                              Region &comparatorRegion,
+                              ArrayRef<bool> reductionMask) const {
+    VectorType flatValType = flatVal.getType();
+    VectorType flatIdxType = flatIdx.getType();
+    int64_t numElements = flatValType.getNumElements();
+    Location loc = flatVal.getLoc();
+    Type elemType = flatValType.getElementType();
+
+    // Try to map the comparator to a SubgroupReduceOp.
+    // If successful, use SubgroupReduceOp which can be lowered to DPP.
+    // Otherwise, fall back to the shuffle-based implementation.
+    std::optional<gpu::AllReduceOperation> reduceOp =
+        getReduceOpFromComparator(comparatorRegion, elemType);
+
+    // Initialize result vectors
+    auto zeroValOp = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getZeroAttr(flatValType));
+    auto resVal = cast<VectorValue>(zeroValOp.getResult());
+
+    auto zeroIdxOp = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getZeroAttr(flatIdxType));
+    auto resIdx = cast<VectorValue>(zeroIdxOp.getResult());
+
+    // Process each element
+    for (unsigned i = 0; i < numElements; ++i) {
+      Value extractedVal = vector::ExtractOp::create(rewriter, loc, flatVal, i);
+      Value extractedIdx = vector::ExtractOp::create(rewriter, loc, flatIdx, i);
+
+      // Reduce across all reduction dimensions
+      for (unsigned dim = 0, e = reductionMask.size(); dim != e; ++dim) {
+        if (!reductionMask[dim]) {
+          continue;
+        }
+
+        int64_t offset = getShuffleOffset(layout, dim);
+        int64_t width = getShuffleWidth(layout, dim);
+        assert(offset <= std::numeric_limits<uint32_t>::max() &&
+               width <= std::numeric_limits<uint32_t>::max());
+
+        auto i32Type = rewriter.getI32Type();
+        auto i64Type = rewriter.getI64Type();
+        Value width32 = arith::ConstantOp::create(
+            rewriter, loc, rewriter.getIntegerAttr(i32Type, width));
+
+        Value currentVal;
+        if (reduceOp.has_value()) {
+          // Use SubgroupReduceOp for value reduction.
+          // This enables DPP lowering on AMD GPUs when cluster_stride == 1.
+          currentVal = gpu::SubgroupReduceOp::create(
+              rewriter, loc, extractedVal, *reduceOp,
+              /*uniform=*/false, /*cluster_size=*/width,
+              /*cluster_stride=*/offset);
+        } else {
+          // Fall back to DPP/shuffle-based butterfly reduction for complex
+          // comparators that don't map to standard reduce operations.
+          // We use amdgpu::DPPOp directly for known XOR offsets (1,2,4,8,16,32)
+          // which gives us fast v_mov_b32_dpp instead of slow ds_bpermute_b32.
+          int64_t numStages = llvm::Log2_64_Ceil(width);
+          currentVal = extractedVal;
+
+          for (int64_t stage = 0; stage < numStages; ++stage) {
+            int64_t shuffleOffset = offset * (1 << stage);
+
+            // Try to use DPP for the shuffle (much faster than ds_bpermute).
+            // createDPPShuffleXOR returns nullptr for unsupported offsets.
+            Value shuffledVal = createDPPShuffleXOR(rewriter, loc, currentVal,
+                                                    shuffleOffset);
+            if (!shuffledVal) {
+              // Fall back to ShuffleOp for unsupported offsets
+              Value shuffleOffset32 = arith::ConstantOp::create(
+                  rewriter, loc, rewriter.getIntegerAttr(i32Type, shuffleOffset));
+              shuffledVal =
+                  gpu::ShuffleOp::create(rewriter, loc, currentVal, shuffleOffset32,
+                                         width32, gpu::ShuffleMode::XOR)
+                      .getShuffleResult();
+            }
+
+            // Apply comparator to determine winner
+            Block *comparatorBlock = &comparatorRegion.front();
+            IRMapping mapping;
+            mapping.map(comparatorBlock->getArgument(0), currentVal);
+            mapping.map(comparatorBlock->getArgument(1), shuffledVal);
+
+            Value cmpResult;
+            for (Operation &op : comparatorBlock->getOperations()) {
+              if (auto yieldOp = dyn_cast<IREE::VectorExt::YieldOp>(op)) {
+                cmpResult = mapping.lookup(yieldOp.getValues()[0]);
+                break;
+              }
+              rewriter.clone(op, mapping);
+            }
+
+            if (!cmpResult) {
+              return failure();
+            }
+
+            // Update current value to the winner
+            currentVal = arith::SelectOp::create(rewriter, loc, cmpResult,
+                                                 currentVal, shuffledVal);
+          }
+        }
+
+        // Now we have the winning value in all threads of this reduction group.
+        // Use ballot to find which thread(s) have this winning value.
+
+        // Create a ballot condition: does my original value equal the winning
+        // value?
+        Value myValueIsWinner;
+        if (isa<FloatType>(elemType)) {
+          myValueIsWinner = arith::CmpFOp::create(
+              rewriter, loc, arith::CmpFPredicate::OEQ, extractedVal,
+              currentVal);
+        } else {
+          myValueIsWinner = arith::CmpIOp::create(
+              rewriter, loc, arith::CmpIPredicate::eq, extractedVal, currentVal);
+        }
+
+        // Use ROCDL ballot to get bitmask of threads with winning value.
+        // rocdl.ballot returns i64 bitmask where bit N is set if thread N has
+        // true condition.
+        auto ballotOp =
+            ROCDL::BallotOp::create(rewriter, loc, i64Type, myValueIsWinner);
+        Value winnerMask = ballotOp.getResult();
+
+        // Find the thread with the smallest index among winners.
+        // This is the lowest set bit in the ballot mask.
+        // cttz returns the number of trailing zeros = index of first set bit.
+        Value winningThreadIdI64 =
+            math::CountTrailingZerosOp::create(rewriter, loc, i64Type, winnerMask);
+
+        // Truncate to i32 for the shuffle operation.
+        Value winningThreadId =
+            arith::TruncIOp::create(rewriter, loc, i32Type, winningThreadIdI64);
+
+        // Shuffle to get the index from the winning thread.
+        // Use gpu.shuffle with mode IDX to get value from specific thread.
+        Value winningIdx =
+            gpu::ShuffleOp::create(rewriter, loc, extractedIdx, winningThreadId,
+                                   width32, gpu::ShuffleMode::IDX)
+                .getShuffleResult();
+
+        extractedVal = currentVal;
+        extractedIdx = winningIdx;
+      }
+
+      // Insert the reduced value and index back into result vectors
+      resVal = vector::InsertOp::create(rewriter, loc, extractedVal, resVal, i);
+      resIdx = vector::InsertOp::create(rewriter, loc, extractedIdx, resIdx, i);
+    }
+
+    return std::make_pair(resVal, resIdx);
+  }
+
+  // Helper to perform subgroup-level reduction for arg_compare.
+  // This handles reductions distributed across multiple subgroups using shared memory.
+  std::pair<VectorValue, VectorValue>
+  doArgCompareSubgroupReduction(PatternRewriter &rewriter, Location loc,
+                                VectorValue srcVal, VectorValue srcIdx,
+                                NestedLayoutAttr srcLayout,
+                                int64_t reductionDim,
+                                VectorValue threadReducedVal,
+                                VectorValue threadReducedIdx,
+                                Region &comparatorRegion,
+                                VectorLayoutInterface resValLayout,
+                                VectorLayoutInterface resIdxLayout) const {
+    // The approach for subgroup reduction with arg_compare:
+    // 1. Reshape thread-reduced results to maintain rank
+    // 2. Write value and index to separate shared memory buffers
+    // 3. Read back with layout where subgroup tiles become element tiles
+    // 4. Create a new arg_compare to complete the reduction
+
+    int64_t rank = srcLayout.getRank();
+    SmallVector<int64_t> reductionDims(rank, 0);
+    reductionDims[reductionDim] = 1;
+
+    // Step 1: Re-insert reduction dimensions to maintain rank
+    SmallVector<int64_t> partialReducedShape = srcLayout.getDistributedShape();
+    for (int64_t tileGroupIdx : llvm::seq<int64_t>(3)) {
+      int64_t offset = tileGroupIdx * rank;
+      partialReducedShape[offset + reductionDim] = 1;
+    }
+
+    VectorType partialReducedValType = VectorType::get(
+        partialReducedShape, srcVal.getType().getElementType());
+    VectorType partialReducedIdxType = VectorType::get(
+        partialReducedShape, srcIdx.getType().getElementType());
+
+    Value isoRankVal = vector::ShapeCastOp::create(
+        rewriter, loc, partialReducedValType, threadReducedVal);
+    Value isoRankIdx = vector::ShapeCastOp::create(
+        rewriter, loc, partialReducedIdxType, threadReducedIdx);
+
+    // Step 2: Convert to SIMD form for writing to shared memory
+    SmallVector<int64_t> preDistrShape = srcLayout.getUndistributedPackedShape();
+    SmallVector<int64_t> partialReductionShape =
+        llvm::to_vector(srcVal.getType().getShape());
+    partialReductionShape[reductionDim] = preDistrShape[reductionDim];
+
+    auto unDistributedValType = VectorType::get(
+        partialReductionShape, srcVal.getType().getElementType());
+    auto unDistributedIdxType = VectorType::get(
+        partialReductionShape, srcIdx.getType().getElementType());
+
+    VectorValue valToWrite = IREE::VectorExt::ToSIMDOp::create(
+        rewriter, loc, unDistributedValType, isoRankVal);
+    VectorValue idxToWrite = IREE::VectorExt::ToSIMDOp::create(
+        rewriter, loc, unDistributedIdxType, isoRankIdx);
+
+    // Step 3: Allocate shared memory buffers
+    auto workgroupSpace = Attribute(gpu::AddressSpaceAttr::get(
+        rewriter.getContext(), gpu::AddressSpace::Workgroup));
+    MemRefType valMemType = MemRefType::get(
+        partialReductionShape, srcVal.getType().getElementType(),
+        AffineMap(), workgroupSpace);
+    MemRefType idxMemType = MemRefType::get(
+        partialReductionShape, srcIdx.getType().getElementType(),
+        AffineMap(), workgroupSpace);
+
+    Value valBuffer = getBufferForSubgroupReduction(rewriter, valMemType, valToWrite);
+    Value idxBuffer = getBufferForSubgroupReduction(rewriter, idxMemType, idxToWrite);
+
+    // Step 4: Write partial results to shared memory
+    writeArgComparePartialToBuffer(rewriter, loc, valToWrite, idxToWrite,
+                                   valBuffer, idxBuffer, srcLayout, {reductionDim});
+
+    // Step 5: Read back and complete reduction
+    return doArgCompareSubgroupReductionFromBuffer(
+        rewriter, loc, valBuffer, idxBuffer, srcLayout,
+        resValLayout, resIdxLayout, {reductionDim}, comparatorRegion);
+  }
+
+  Value getBufferForSubgroupReduction(RewriterBase &rewriter, MemRefType memTy,
+                                      Value val) const {
+    auto alloc = memref::AllocOp::create(rewriter, val.getLoc(), memTy);
+    gpu::BarrierOp::create(rewriter, val.getLoc(), alloc);
+    return alloc;
+  }
+
+  void writeArgComparePartialToBuffer(RewriterBase &rewriter, Location loc,
+                                     VectorValue valToWrite, VectorValue idxToWrite,
+                                     Value valBuffer, Value idxBuffer,
+                                     NestedLayoutAttr srcLayout,
+                                     ArrayRef<int64_t> reductionDims) const {
+    Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    VectorType valType = valToWrite.getType();
+    SmallVector<Value> indices(valType.getRank(), c0);
+    SmallVector<bool> inBounds(valType.getRank(), true);
+
+    // Write value vector
+    auto writeVal = vector::TransferWriteOp::create(
+        rewriter, loc, valToWrite, valBuffer, indices, inBounds);
+
+    // Write index vector
+    auto writeIdx = vector::TransferWriteOp::create(
+        rewriter, loc, idxToWrite, idxBuffer, indices, inBounds);
+
+    // Set layout for both writes
+    auto subgroupTile = llvm::to_vector_of<int64_t>(srcLayout.getSubgroupTile());
+    auto batchTile = llvm::to_vector_of<int64_t>(srcLayout.getBatchTile());
+    auto outerTile = llvm::to_vector_of<int64_t>(srcLayout.getOuterTile());
+    auto threadTile = llvm::to_vector_of<int64_t>(srcLayout.getThreadTile());
+    auto elementTile = llvm::to_vector_of<int64_t>(srcLayout.getElementTile());
+    auto subgroupStrides = llvm::to_vector_of<int64_t>(srcLayout.getSubgroupStrides());
+    auto threadStrides = llvm::to_vector_of<int64_t>(srcLayout.getThreadStrides());
+
+    for (int64_t rDim : reductionDims) {
+      batchTile[rDim] = 1;
+      outerTile[rDim] = 1;
+      threadTile[rDim] = 1;
+      elementTile[rDim] = 1;
+      threadStrides[rDim] = 0;
+    }
+
+    auto interSubgroupLayout = IREE::VectorExt::NestedLayoutAttr::get(
+        rewriter.getContext(), subgroupTile, batchTile, outerTile,
+        threadTile, elementTile, subgroupStrides, threadStrides);
+    setSignatureForRedistribution(rewriter, writeVal, {interSubgroupLayout}, {});
+    setSignatureForRedistribution(rewriter, writeIdx, {interSubgroupLayout}, {});
+  }
+
+  std::pair<VectorValue, VectorValue>
+  doArgCompareSubgroupReductionFromBuffer(
+      RewriterBase &rewriter, Location loc,
+      Value valBuffer, Value idxBuffer,
+      NestedLayoutAttr srcLayout,
+      VectorLayoutInterface resValLayout,
+      VectorLayoutInterface resIdxLayout,
+      ArrayRef<int64_t> reductionDims,
+      Region &comparatorRegion) const {
+
+    NestedLayoutAttr readLayout =
+        getLayoutForReductionFromBuffer(srcLayout, reductionDims);
+
+    // Create padding values (neutral elements for arg_compare)
+    // For values, use -inf for argmax, +inf for argmin
+    // For indices, use max int value
+    Type valElemType = getElementTypeOrSelf(valBuffer);
+    Type idxElemType = getElementTypeOrSelf(idxBuffer);
+
+    // Use a very negative value for float padding (represents "not selected")
+    Value valPad;
+    if (isa<FloatType>(valElemType)) {
+      auto floatType = cast<FloatType>(valElemType);
+      APFloat negInf = APFloat::getInf(floatType.getFloatSemantics(), /*Negative=*/true);
+      valPad = arith::ConstantFloatOp::create(
+          rewriter, loc, floatType, negInf);
+    } else {
+      // For integer types, use min value
+      auto intType = cast<IntegerType>(valElemType);
+      APInt minVal = APInt::getSignedMinValue(intType.getWidth());
+      valPad = arith::ConstantIntOp::create(
+          rewriter, loc, intType, minVal);
+    }
+
+    // For indices, use max value (will be rejected by comparator)
+    auto idxIntType = cast<IntegerType>(idxElemType);
+    APInt maxIdx = APInt::getSignedMaxValue(idxIntType.getWidth());
+    Value idxPad = arith::ConstantIntOp::create(
+        rewriter, loc, idxIntType, maxIdx);
+
+    auto valReadTy = VectorType::get(readLayout.getUndistributedShape(), valElemType);
+    auto idxReadTy = VectorType::get(readLayout.getUndistributedShape(), idxElemType);
+    auto zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    auto inBounds = rewriter.getBoolArrayAttr(
+        SmallVector<bool>(readLayout.getRank(), true));
+
+    SmallVector<Value> readIndices(readLayout.getRank(), zero);
+
+    // Read value vector from buffer
+    auto readVal = vector::TransferReadOp::create(
+        rewriter, loc, valReadTy, valBuffer, readIndices,
+        rewriter.getMultiDimIdentityMap(readLayout.getRank()),
+        valPad, /*mask=*/nullptr, inBounds);
+
+    // Read index vector from buffer
+    auto readIdx = vector::TransferReadOp::create(
+        rewriter, loc, idxReadTy, idxBuffer, readIndices,
+        rewriter.getMultiDimIdentityMap(readLayout.getRank()),
+        idxPad, /*mask=*/nullptr, inBounds);
+
+    // TransferReadOp has no vector operands, only a vector result
+    setSignatureForRedistribution(rewriter, readVal, {}, {readLayout});
+    setSignatureForRedistribution(rewriter, readIdx, {}, {readLayout});
+
+    // Create a new arg_compare to complete the reduction
+    // This will be distributed again and eventually lower to shuffles
+
+    // Determine the result type after reducing along reductionDims[0]
+    // The result has the same shape as the input, but with the reduction dimension removed
+    SmallVector<int64_t> resultShape = llvm::to_vector(valReadTy.getShape());
+    resultShape.erase(resultShape.begin() + reductionDims[0]);
+
+    Type resultValElemType = valReadTy.getElementType();
+    Type resultIdxElemType = idxReadTy.getElementType();
+    VectorType resultValType = VectorType::get(resultShape, resultValElemType);
+    VectorType resultIdxType = VectorType::get(resultShape, resultIdxElemType);
+
+    // For values, use -inf (neutral for argmax)
+    Value initVal;
+    if (auto floatType = dyn_cast<FloatType>(resultValElemType)) {
+      APFloat negInf = APFloat::getInf(floatType.getFloatSemantics(), /*Negative=*/true);
+      auto resultAttr = DenseElementsAttr::get(resultValType, negInf);
+      initVal = arith::ConstantOp::create(rewriter, loc, resultValType, resultAttr);
+    } else {
+      auto intType = cast<IntegerType>(resultValElemType);
+      APInt minVal = APInt::getSignedMinValue(intType.getWidth());
+      auto resultAttr = DenseElementsAttr::get(resultValType, minVal);
+      initVal = arith::ConstantOp::create(rewriter, loc, resultValType, resultAttr);
+    }
+
+    // For indices, use max int (will be rejected by comparator)
+    auto resultIdxIntType = cast<IntegerType>(resultIdxElemType);
+    APInt resultMaxIdx = APInt::getSignedMaxValue(resultIdxIntType.getWidth());
+    auto resultIdxAttr = DenseElementsAttr::get(resultIdxType, resultMaxIdx);
+    Value initIdx = arith::ConstantOp::create(rewriter, loc, resultIdxType, resultIdxAttr);
+
+    auto secondReduction = IREE::VectorExt::ArgCompareOp::create(
+        rewriter, loc,
+        TypeRange{resultValType, resultIdxType},
+        /*input_value=*/readVal.getResult(),
+        /*input_index=*/readIdx.getResult(),
+        /*init_value=*/cast<VectorValue>(initVal),
+        /*init_index=*/cast<VectorValue>(initIdx),
+        /*index_base=*/nullptr,
+        /*dimension=*/reductionDims[0]);
+
+    // Clone the comparator region
+    Region &dstRegion = secondReduction.getRegion();
+    rewriter.cloneRegionBefore(comparatorRegion, dstRegion, dstRegion.end());
+
+    // Set signatures for operands and results
+    // Only non-0D vector operands need layouts. The init values are 0-D vectors (scalars)
+    // and should not have layouts. We only pass layouts for the input_value and input_index.
+    // Results are also 0-D vectors, so they don't need layouts either.
+    setSignatureForRedistribution(rewriter, secondReduction,
+                                  {readLayout, readLayout},
+                                  {});
+
+    return std::make_pair(secondReduction.getResultValue(),
+                         secondReduction.getResultIndex());
+  }
+
+  NestedLayoutAttr
+  getLayoutForReductionFromBuffer(NestedLayoutAttr srcLayout,
+                                  ArrayRef<int64_t> reductionDims) const {
+    auto subgroupTile = llvm::to_vector_of<int64_t>(srcLayout.getSubgroupTile());
+    auto batchTile = llvm::to_vector_of<int64_t>(srcLayout.getBatchTile());
+    auto outerTile = llvm::to_vector_of<int64_t>(srcLayout.getOuterTile());
+    auto threadTile = llvm::to_vector_of<int64_t>(srcLayout.getThreadTile());
+    auto elementTile = llvm::to_vector_of<int64_t>(srcLayout.getElementTile());
+    auto subgroupStrides = llvm::to_vector_of<int64_t>(srcLayout.getSubgroupStrides());
+    auto threadStrides = llvm::to_vector_of<int64_t>(srcLayout.getThreadStrides());
+
+    int64_t threadsRequired = 1;
+    for (int64_t rDim : reductionDims) {
+      threadsRequired *= llvm::PowerOf2Ceil(subgroupTile[rDim]);
+    }
+
+    std::optional<int64_t> availableThreads;
+    int64_t threadStride = 0;
+    for (int64_t rDim : reductionDims) {
+      if (threadTile[rDim] >= threadsRequired) {
+        availableThreads = threadTile[rDim];
+        threadStride = threadStrides[rDim];
+        break;
+      }
+    }
+
+    for (int64_t rDim : reductionDims) {
+      batchTile[rDim] = 1;
+      outerTile[rDim] = 1;
+      elementTile[rDim] = 1;
+      if (availableThreads.has_value()) {
+        int64_t used = llvm::PowerOf2Ceil(subgroupTile[rDim]);
+        threadStrides[rDim] = threadStride;
+        threadTile[rDim] = used;
+        availableThreads.value() /= used;
+        threadStride *= used;
+      } else {
+        threadStrides[rDim] = 0;
+        threadTile[rDim] = 1;
+      }
+      subgroupTile[rDim] = 1;
+      subgroupStrides[rDim] = 0;
+    }
+
+    return IREE::VectorExt::NestedLayoutAttr::get(
+        srcLayout.getContext(), subgroupTile, batchTile, outerTile,
+        threadTile, elementTile, subgroupStrides, threadStrides);
+  }
+
+  int64_t subgroupSize;
+  int64_t maxBitsPerShuffle;
+};
+
 } // namespace
 
 void populateGPUDistributeNestedLayoutAttrPatterns(
@@ -2335,6 +3344,8 @@ void populateGPUDistributeNestedLayoutAttrPatterns(
       patterns.getContext());
   patterns.add<DistributeMultiReduction>(patterns.getContext(), subgroupSize,
                                          maxBitsPerShuffle);
+  patterns.add<DistributeArgCompare>(patterns.getContext(), subgroupSize,
+                                     maxBitsPerShuffle);
   patterns.add<DistributeContract>(patterns.getContext());
   patterns.add<DistributeBatchOuterToLayoutConversions>(patterns.getContext());
   patterns.add<DistributeInnerTiled>(patterns.getContext());

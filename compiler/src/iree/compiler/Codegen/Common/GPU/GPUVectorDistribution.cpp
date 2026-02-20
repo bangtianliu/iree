@@ -8,6 +8,7 @@
 #include "iree/compiler/Codegen/Common/Transforms.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtOps.h"
+#include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/PatternMatch.h"
@@ -43,41 +44,60 @@ setOpSignature(Operation *op,
   SmallVector<Attribute> operands;
   SmallVector<Attribute> results;
 
-  for (Value operand : op->getOperands()) {
-    if (auto vectorOperand = dyn_cast<VectorValue>(operand)) {
-      if (auto layout = layouts.lookup(vectorOperand)) {
-        operands.push_back(layout);
-        continue;
-      }
-      if (auto layout = options.getDefaultLayout(vectorOperand.getType())) {
-        operands.push_back(layout);
-        continue;
-      }
-      return failure();
-    }
-    operands.push_back(UnitAttr::get(op->getContext()));
-  }
+  // Count total operands including non-vectors and 0-D vectors for UnitAttr
+  SmallVector<Attribute> allOperands(op->getNumOperands(), UnitAttr::get(op->getContext()));
 
-  for (Value result : op->getResults()) {
-    if (auto vectorResult = dyn_cast<VectorValue>(result)) {
-      if (auto layout = layouts.lookup(vectorResult)) {
-        results.push_back(layout);
-        continue;
+  // Only fill in layouts for non-zero rank vectors
+  for (auto [idx, operand] : llvm::enumerate(op->getOperands())) {
+    if (auto vectorOperand = dyn_cast<VectorValue>(operand)) {
+      // Check if this is a non-zero rank vector (needs distribution)
+      if (isNonZeroRank(vectorOperand)) {
+        if (auto layout = layouts.lookup(vectorOperand)) {
+          allOperands[idx] = layout;
+          continue;
+        }
+        if (auto layout = options.getDefaultLayout(vectorOperand.getType())) {
+          allOperands[idx] = layout;
+          continue;
+        }
+        return failure();
       }
-      if (auto layout = options.getDefaultLayout(vectorResult.getType())) {
-        results.push_back(layout);
-        continue;
-      }
-      return failure();
+      // 0-D vector (scalar) - already has UnitAttr from initialization
     }
-    results.push_back(UnitAttr::get(op->getContext()));
+    // Non-vector operands already have UnitAttr from initialization
   }
+  operands = std::move(allOperands);
+
+  // Count total results including non-vectors and 0-D vectors for UnitAttr
+  SmallVector<Attribute> allResults(op->getNumResults(), UnitAttr::get(op->getContext()));
+
+  // Only fill in layouts for non-zero rank vectors
+  for (auto [idx, result] : llvm::enumerate(op->getResults())) {
+    if (auto vectorResult = dyn_cast<VectorValue>(result)) {
+      // Check if this is a non-zero rank vector (needs distribution)
+      if (isNonZeroRank(vectorResult)) {
+        if (auto layout = layouts.lookup(vectorResult)) {
+          allResults[idx] = layout;
+          continue;
+        }
+        if (auto layout = options.getDefaultLayout(vectorResult.getType())) {
+          allResults[idx] = layout;
+          continue;
+        }
+        return failure();
+      }
+      // 0-D vector (scalar) - already has UnitAttr from initialization
+    }
+    // Non-vector results already have UnitAttr from initialization
+  }
+  results = std::move(allResults);
 
   ArrayAttr operandsAttr = ArrayAttr::get(op->getContext(), operands);
   ArrayAttr resultsAttr = ArrayAttr::get(op->getContext(), results);
   Attribute signature[] = {operandsAttr, resultsAttr};
   op->setAttr(kVectorLayoutFetcherStorageAttrName,
               ArrayAttr::get(op->getContext(), signature));
+
   return success();
 }
 
@@ -102,11 +122,14 @@ static DistributionSignature getOpSignature(Operation *op) {
   DistributionSignature signature;
 
   auto addLayoutToSignature([&](Value value, Attribute layout) {
-    // Ignore null attributes.
+    // Unit attributes are used for non-vector values AND 0-D vectors (scalars).
+    // Scalars are always distributed to all threads, so they don't get layouts.
     if (isa<UnitAttr>(layout)) {
-      assert(!isa<VectorValue>(value) &&
-             "Malformed signature attribute: unit attribute for vector value.");
-      return;
+      if (auto vectorValue = dyn_cast<VectorValue>(value)) {
+        assert(!isNonZeroRank(vectorValue) &&
+               "Malformed signature attribute: unit attribute for non-zero rank vector.");
+      }
+      return; // Don't add to signature map
     }
 
     assert(isa<VectorValue>(value) &&
@@ -137,10 +160,14 @@ DistributionPattern::getDistributed(RewriterBase &rewriter, VectorValue value,
   if (auto toSIMD = value.getDefiningOp<IREE::VectorExt::ToSIMDOp>()) {
     return cast<VectorValue>(toSIMD.getInput());
   }
+
   // Create a "to_simt" op to convert the value to the distributed layout.
   SmallVector<int64_t> distributedShape = layout.getDistributedShape();
   VectorType distributedType =
       VectorType::get(distributedShape, value.getType().getElementType());
+
+  // For rank-0 vectors with empty distributed shape, the distributed type
+  // is the same as the input type. Still create a ToSIMTOp for consistency.
   auto toSIMT = IREE::VectorExt::ToSIMTOp::create(rewriter, value.getLoc(),
                                                   distributedType, value);
   return toSIMT.getResult();
@@ -152,7 +179,13 @@ SmallVector<Value> DistributionPattern::getOpDistributedReplacements(
   for (auto [opResult, replacement] :
        llvm::zip_equal(op->getOpResults(), values)) {
     // If this value is a vector type, it must be converted back to simd.
-    if (isa<VectorType>(replacement.getType())) {
+    // However, 0-D vectors (scalars) don't need ToSIMD conversion.
+    auto replacementVecType = dyn_cast<VectorType>(replacement.getType());
+    auto originalVecType = dyn_cast<VectorType>(opResult.getType());
+
+    // Only create to_simd if BOTH the replacement AND original are non-0D vectors
+    if (replacementVecType && replacementVecType.getRank() != 0 &&
+        originalVecType && originalVecType.getRank() != 0) {
       auto oldResult = cast<VectorValue>(opResult);
       // Create a toSIMD op to convert the value back to the simd.
       rewriter.setInsertionPointAfterValue(oldResult);
@@ -160,6 +193,13 @@ SmallVector<Value> DistributionPattern::getOpDistributedReplacements(
           rewriter, oldResult.getLoc(), oldResult.getType(), replacement);
       // Add to replacements.
       replacement = toSIMD;
+    } else if (replacementVecType && originalVecType &&
+               replacementVecType != originalVecType) {
+      // If types don't match (e.g., vector<1x1xi32> -> vector<i32>),
+      // use shape_cast to convert
+      rewriter.setInsertionPointAfterValue(opResult);
+      replacement = vector::ShapeCastOp::create(
+          rewriter, opResult.getLoc(), originalVecType, replacement);
     }
     replacements.push_back(replacement);
   }
@@ -191,21 +231,40 @@ void DistributionPattern::setSignatureForRedistribution(
   auto outputAttrs = SmallVector<Attribute>(op->getNumResults(), unitAttr);
 
   auto isVectorType = [](Value x) { return isa<VectorType>(x.getType()); };
-  assert(llvm::count_if(op->getOperands(), isVectorType) ==
-         inputLayouts.size());
+
+  // Only count non-0D vectors (0-D vectors are scalars and don't need layouts)
+  // Use NDEBUG check to avoid unused variable warnings in Release builds
+#ifndef NDEBUG
+  auto isNon0DVectorType = [](Value x) {
+    auto vecType = dyn_cast<VectorType>(x.getType());
+    return vecType && vecType.getRank() > 0;
+  };
+  assert(llvm::count_if(op->getOperands(), isNon0DVectorType) ==
+         static_cast<int64_t>(inputLayouts.size()));
+#endif
   int64_t currVectorInput = 0;
   for (auto [idx, operand] : llvm::enumerate(op->getOperands())) {
     if (isVectorType(operand)) {
+      // Skip 0-D vectors (scalars)
+      if (cast<VectorType>(operand.getType()).getRank() == 0) {
+        // Already initialized to unitAttr
+        continue;
+      }
       inputAttrs[idx] = inputLayouts[currVectorInput];
       ++currVectorInput;
     }
   }
 
-  assert(llvm::count_if(op->getResults(), isVectorType) ==
+  assert(llvm::count_if(op->getResults(), isNon0DVectorType) ==
          outputLayouts.size());
   int64_t currVectorOutput = 0;
   for (auto [idx, result] : llvm::enumerate(op->getResults())) {
     if (isVectorType(result)) {
+      // Skip 0-D vectors (scalars)
+      if (cast<VectorType>(result.getType()).getRank() == 0) {
+        // Already initialized to unitAttr
+        continue;
+      }
       outputAttrs[idx] = outputLayouts[currVectorOutput];
       ++currVectorOutput;
     }
@@ -359,12 +418,14 @@ LogicalResult distributeVectorOps(Operation *root,
                                   VectorLayoutOptions &options) {
   // Run the analysis and determine the layouts.
   LLVM_DEBUG(llvm::dbgs() << "Running Layout Analysis\n");
+
   llvm::MapVector<Value, VectorLayoutInterface> layouts;
   if (failed(propagateVectorLayoutInfo(root, layouts))) {
     LLVM_DEBUG(llvm::dbgs() << "Layout Analysis Failed\n");
     return failure();
   }
   LLVM_DEBUG(llvm::dbgs() << "Layout Analysis Succeded\n");
+
   LLVM_DEBUG(llvm::dbgs() << "\n\n");
 
   // Go to each operation, and set its distribution signature.

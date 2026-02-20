@@ -124,10 +124,12 @@ iree_cc_library(
     MLIRLinalgUtils
     MLIRLoopLikeInterface
     MLIRMemRefDialect
+    MLIRMathDialect
     MLIRMemRefTransforms
     MLIRMemRefUtils
     MLIRNVGPUDialect
     MLIRPass
+    MLIRROCDLDialect
     MLIRRewrite
     MLIRSCFDialect
     MLIRSCFTransforms

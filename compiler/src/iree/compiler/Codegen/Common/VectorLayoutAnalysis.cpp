@@ -7,6 +7,7 @@
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Common/Transforms.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
+#include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtOps.h"
 
 #include <cassert>
 
@@ -126,6 +127,42 @@ void LayoutInfo::propagateLayoutForward(Value val) {
       }
     }
 
+    // Handle iree_vector_ext.arg_compare - similar to multi_reduction
+    if (auto argCompare = dyn_cast<ArgCompareOp>(user)) {
+      if (argCompare.getInputValue() == val) {
+        // Input value determines the result layout via projection
+        int64_t reductionDim = argCompare.getDimension();
+        int64_t rank = argCompare.getInputRank();
+        SmallVector<bool> reductionMask(rank, false);
+        reductionMask[reductionDim] = true;
+        VectorLayoutInterface reduceLayout = layout.project(reductionMask);
+        setLayoutIfUnset(argCompare.getResultValue(), reduceLayout);
+        setLayoutIfUnset(argCompare.getResultIndex(), reduceLayout);
+        continue;
+      }
+      if (argCompare.getInputIndex() && argCompare.getInputIndex() == val) {
+        // Input index has same shape as input value, same projection
+        int64_t reductionDim = argCompare.getDimension();
+        int64_t rank = argCompare.getInputRank();
+        SmallVector<bool> reductionMask(rank, false);
+        reductionMask[reductionDim] = true;
+        VectorLayoutInterface reduceLayout = layout.project(reductionMask);
+        setLayoutIfUnset(argCompare.getResultValue(), reduceLayout);
+        setLayoutIfUnset(argCompare.getResultIndex(), reduceLayout);
+        continue;
+      }
+      if (argCompare.getInitValue() == val) {
+        // Init value propagates to result
+        setLayoutIfUnset(argCompare.getResultValue(), layout);
+        continue;
+      }
+      if (argCompare.getInitIndex() == val) {
+        // Init index propagates to result index
+        setLayoutIfUnset(argCompare.getResultIndex(), layout);
+        continue;
+      }
+    }
+
     if (auto transpose = dyn_cast<vector::TransposeOp>(user)) {
       if (transpose.getVector() == val) {
         setLayoutIfUnset(transpose.getResult(),
@@ -225,6 +262,18 @@ void LayoutInfo::propagateLayoutBackward(Value val) {
 
   if (auto multiReduce = dyn_cast<vector::MultiDimReductionOp>(defOp)) {
     setLayoutOrClone(&multiReduce.getAccMutable(), layout);
+    return;
+  }
+
+  // Handle iree_vector_ext.arg_compare - propagate layout back to init operands
+  if (auto argCompare = dyn_cast<ArgCompareOp>(defOp)) {
+    // Results have same layout as init operands
+    if (val == argCompare.getResultValue()) {
+      setLayoutOrClone(&argCompare.getInitValueMutable(), layout);
+    }
+    if (val == argCompare.getResultIndex()) {
+      setLayoutOrClone(&argCompare.getInitIndexMutable(), layout);
+    }
     return;
   }
 

@@ -921,6 +921,124 @@ transform_dialect::AMDGPUDistributeVectorsOp::applyToOne(
   populateGPUDistributionPatterns(patterns);
   populateGPUDistributeNestedLayoutAttrPatterns(patterns, laneId, subgroupSize,
                                                 workgroupSize);
+
+  // Set layout anchors for arg_compare operations before distribution
+  SmallVector<IREE::VectorExt::ArgCompareOp> argCompareOps;
+  target->walk([&](IREE::VectorExt::ArgCompareOp op) {
+    argCompareOps.push_back(op);
+  });
+
+  for (auto argCompareOp : argCompareOps) {
+    int64_t reductionDim = argCompareOp.getDimension();
+    TypedValue<VectorType> inputValue = argCompareOp.getInputValue();
+    auto inputValueType = inputValue.getType();
+
+    if (!inputValueType) {
+      continue;
+    }
+
+    // Create nested layout for the input vector
+    SmallVector<int64_t> shape(inputValueType.getShape().begin(),
+                                inputValueType.getShape().end());
+    int64_t rank = shape.size();
+
+    SmallVector<int64_t> subgroupTile(rank, 1);
+    SmallVector<int64_t> batchTile(rank, 1);
+    SmallVector<int64_t> outerTile(rank, 1);
+    SmallVector<int64_t> threadTile(rank, 1);
+    SmallVector<int64_t> elementTile(rank, 1);
+
+    threadTile[reductionDim] = std::min(shape[reductionDim], subgroupSize);
+
+    SmallVector<int64_t> subgroupStrides(rank, 0);
+    SmallVector<int64_t> threadStrides(rank, 0);
+    threadStrides[reductionDim] = 1;
+
+    auto inputLayout = IREE::VectorExt::NestedLayoutAttr::get(
+        rewriter.getContext(), subgroupTile, batchTile, outerTile,
+        threadTile, elementTile, subgroupStrides, threadStrides);
+
+    rewriter.setInsertionPoint(argCompareOp);
+    Location loc = argCompareOp.getLoc();
+
+    auto layoutedInputValue = IREE::VectorExt::ToLayoutOp::create(
+        rewriter, loc, inputValue, inputLayout);
+    argCompareOp->setOperand(0, layoutedInputValue.getResult());
+
+    if (Value inputIndex = argCompareOp.getInputIndex()) {
+      auto inputIndexVec = dyn_cast<TypedValue<VectorType>>(inputIndex);
+      if (inputIndexVec) {
+        auto layoutedInputIndex = IREE::VectorExt::ToLayoutOp::create(
+            rewriter, loc, inputIndexVec, inputLayout);
+        argCompareOp->setOperand(1, layoutedInputIndex.getResult());
+      }
+    }
+
+    TypedValue<VectorType> initValue = argCompareOp.getInitValue();
+    TypedValue<VectorType> initIndex = argCompareOp.getInitIndex();
+
+    auto initValueType = initValue.getType();
+    if (initValueType.getRank() > 0) {
+      SmallVector<int64_t> initShape(initValueType.getShape().begin(),
+                                      initValueType.getShape().end());
+      int64_t initRank = initShape.size();
+
+      SmallVector<int64_t> initSubgroupTile(initRank, 1);
+      SmallVector<int64_t> initBatchTile(initRank, 1);
+      SmallVector<int64_t> initOuterTile(initRank, 1);
+      SmallVector<int64_t> initThreadTile(initRank, 1);
+      SmallVector<int64_t> initElementTile(initRank, 1);
+      SmallVector<int64_t> initSubgroupStrides(initRank, 0);
+      SmallVector<int64_t> initThreadStrides(initRank, 0);
+
+      auto initLayout = IREE::VectorExt::NestedLayoutAttr::get(
+          rewriter.getContext(), initSubgroupTile, initBatchTile, initOuterTile,
+          initThreadTile, initElementTile, initSubgroupStrides, initThreadStrides);
+
+      auto layoutedInitValue = IREE::VectorExt::ToLayoutOp::create(
+          rewriter, loc, initValue, initLayout);
+      auto layoutedInitIndex = IREE::VectorExt::ToLayoutOp::create(
+          rewriter, loc, initIndex, initLayout);
+
+      int initValueOperandIdx = argCompareOp.getInputIndex() ? 2 : 1;
+      int initIndexOperandIdx = initValueOperandIdx + 1;
+
+      argCompareOp->setOperand(initValueOperandIdx, layoutedInitValue.getResult());
+      argCompareOp->setOperand(initIndexOperandIdx, layoutedInitIndex.getResult());
+    }
+
+    rewriter.setInsertionPointAfter(argCompareOp);
+    if (initValueType.getRank() > 0) {
+      SmallVector<int64_t> initShape(initValueType.getShape().begin(),
+                                      initValueType.getShape().end());
+      int64_t initRank = initShape.size();
+
+      SmallVector<int64_t> resultSubgroupTile(initRank, 1);
+      SmallVector<int64_t> resultBatchTile(initRank, 1);
+      SmallVector<int64_t> resultOuterTile(initRank, 1);
+      SmallVector<int64_t> resultThreadTile(initRank, 1);
+      SmallVector<int64_t> resultElementTile(initRank, 1);
+      SmallVector<int64_t> resultSubgroupStrides(initRank, 0);
+      SmallVector<int64_t> resultThreadStrides(initRank, 0);
+
+      auto resultLayout = IREE::VectorExt::NestedLayoutAttr::get(
+          rewriter.getContext(), resultSubgroupTile, resultBatchTile, resultOuterTile,
+          resultThreadTile, resultElementTile, resultSubgroupStrides, resultThreadStrides);
+
+      auto layoutedResultValue = IREE::VectorExt::ToLayoutOp::create(
+          rewriter, loc, argCompareOp.getResult(0), resultLayout);
+      auto layoutedResultIndex = IREE::VectorExt::ToLayoutOp::create(
+          rewriter, loc, argCompareOp.getResult(1), resultLayout);
+
+      rewriter.replaceAllUsesExcept(argCompareOp.getResult(0),
+                                    layoutedResultValue.getResult(),
+                                    layoutedResultValue);
+      rewriter.replaceAllUsesExcept(argCompareOp.getResult(1),
+                                    layoutedResultIndex.getResult(),
+                                    layoutedResultIndex);
+    }
+  }
+
   if (failed(distributeVectorOps(target, patterns, options))) {
     return emitDefaultSilenceableFailure(target);
   }

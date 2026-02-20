@@ -35,6 +35,12 @@ struct DistributeConstants final : OpDistributionPattern<arith::ConstantOp> {
       return failure();
     }
 
+    // 0-D vectors (scalars) don't need distribution - they're broadcast to all
+    // threads.
+    if (constant.getType().getRank() == 0) {
+      return failure();
+    }
+
     // Only handle splat values for now.
     auto attr = dyn_cast<SplatElementsAttr>(constantOp.getValue());
     if (!attr) {

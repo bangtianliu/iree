@@ -791,4 +791,195 @@ LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
   return setTranslationInfo(entryPoint, translationInfo);
 }
 
+LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
+                                 mlir::FunctionOpInterface entryPoint,
+                                 IREE::LinalgExt::ArgCompareOp op) {
+  // ArgCompareOp is a reduction operation that reduces along a single dimension
+  // and returns both the value and the index.
+
+  MLIRContext *context = op.getContext();
+  OpBuilder b(context);
+
+  // Get the input rank and reduction dimension
+  int64_t inputRank = op.getInputRank();
+  int64_t reductionDim = op.getDimension();
+
+  // Get static loop ranges
+  SmallVector<int64_t> bounds;
+  for (int64_t i = 0; i < inputRank; ++i) {
+    auto dimSize = op.getInputType().getDimSize(i);
+    bounds.push_back(dimSize);
+  }
+
+  IREE::GPU::TargetWgpAttr wgp = target.getWgp();
+
+  // Get the reduction size
+  int64_t reductionSize = bounds[reductionDim];
+  if (!ShapedType::isDynamic(reductionSize) &&
+      reductionSize % target.getPreferredSubgroupSize() != 0) {
+    reductionSize = bounds[reductionDim];
+  }
+
+  if (ShapedType::isDynamic(reductionSize)) {
+    reductionSize = kVectorDistributeReductionSizeToTargetIfDynamic;
+  }
+
+  bool hasDynamicReductionDim = ShapedType::isDynamic(bounds[reductionDim]);
+
+  int64_t subgroupSize = 0;
+  for (int s : wgp.getSubgroupSizeChoices().asArrayRef()) {
+    if (reductionSize % s == 0 || hasDynamicReductionDim) {
+      subgroupSize = s;
+      break;
+    }
+  }
+
+  if (subgroupSize == 0)
+    return failure();
+
+  // Get bit width of the value type
+  Type valueElemType = op.getOutputValueType().getElementType();
+  int64_t bitWidth = IREE::Util::getTypeBitWidth(valueElemType);
+
+  // Reduction distribution only supports 4/8/16/32 bit types now
+  if (!llvm::is_contained({4, 8, 16, 32}, bitWidth)) {
+    return failure();
+  }
+
+  const std::optional<int64_t> maxLoadBits = wgp.getMaxLoadInstructionBits();
+  const unsigned largestLoadSizeInBits = maxLoadBits.value_or(128);
+
+  unsigned threadLoads = largestLoadSizeInBits / bitWidth;
+  if (!hasDynamicReductionDim) {
+    while ((reductionSize / threadLoads) % subgroupSize != 0) {
+      threadLoads /= 2;
+    }
+  }
+
+  // Calculate workgroup size similar to linalg reduction
+  ArrayRef<int32_t> maxWgSizes = wgp.getMaxWorkgroupSizes();
+  int32_t maxWorkgroupSize = *llvm::max_element(maxWgSizes);
+  IREE::GPU::TargetChipAttr chip = target.getChip();
+  const int numWGPs = chip ? chip.getWgpCount() : 512;
+  const int numSIMDs = wgp.getSimdsPerWgp().value_or(4);
+
+  // Calculate parallel size
+  std::optional<int64_t> parallelSize = 1;
+  for (int64_t i = 0; i < inputRank; ++i) {
+    if (i == reductionDim)
+      continue;
+    if (ShapedType::isDynamic(bounds[i])) {
+      parallelSize = std::nullopt;
+      break;
+    }
+    *parallelSize *= bounds[i];
+  }
+
+  // If there is more than enough work, use single subgroup per workgroup
+  if (parallelSize && *parallelSize > numWGPs * numSIMDs) {
+    maxWorkgroupSize = target.getPreferredSubgroupSize();
+  }
+
+  int64_t workgroupSize = reductionSize / threadLoads;
+  if (workgroupSize > maxWorkgroupSize) {
+    workgroupSize = llvm::APIntOps::GreatestCommonDivisor(
+                        {64, static_cast<uint64_t>(workgroupSize)},
+                        {64, static_cast<uint64_t>(maxWorkgroupSize)})
+                        .getZExtValue();
+  }
+
+  const int parallelThreshold = 256;
+  const int targetVectorCount = 8;
+  while (parallelSize && *parallelSize > parallelThreshold &&
+         (workgroupSize / 2) % subgroupSize == 0 &&
+         reductionSize / (workgroupSize * threadLoads) < targetVectorCount) {
+    workgroupSize /= 2;
+    *parallelSize /= 2;
+  }
+
+  // Build the lowering config for ArgCompareOp
+  // ArgCompareOp always has exactly one reduction dimension
+  SmallVector<int64_t> workgroupTileSizes(inputRank, 0);
+  SmallVector<int64_t> partialReductionTileSizes(inputRank, 0);
+  SmallVector<int64_t> threadTileSizes(inputRank, 0);
+  SmallVector<int64_t> threadCounts(inputRank, 1);
+  SmallVector<int64_t> subGroupCounts(inputRank, 1);
+  SmallVector<int64_t> mapping(inputRank);
+  std::iota(mapping.begin(), mapping.end(), 0);
+
+  // Set workgroup tile sizes for parallel dimensions
+  for (int64_t i = 0; i < inputRank; ++i) {
+    if (i != reductionDim) {
+      workgroupTileSizes[i] = 1;
+    }
+  }
+
+  // Configure reduction dimension
+  threadTileSizes[reductionDim] = 1;
+  partialReductionTileSizes[reductionDim] = 1;
+
+  int64_t lastReductionDimSize = bounds[reductionDim];
+  if (ShapedType::isDynamic(lastReductionDimSize)) {
+    lastReductionDimSize = kVectorDistributeReductionSizeToTargetIfDynamic;
+  }
+
+  if (lastReductionDimSize % threadLoads != 0) {
+    return failure();
+  }
+
+  int64_t partialReductionSize = workgroupSize * threadLoads;
+  partialReductionSize = llvm::APIntOps::GreatestCommonDivisor(
+                             {64, static_cast<uint64_t>(partialReductionSize)},
+                             {64, static_cast<uint64_t>(lastReductionDimSize)})
+                             .getZExtValue();
+
+  int64_t threadBasis = subgroupSize;
+  int subgroupStride = threadBasis * threadLoads;
+  while (partialReductionSize % subgroupStride != 0) {
+    threadBasis >>= 1;
+    subgroupStride = threadBasis * threadLoads;
+  }
+  int subgroup = partialReductionSize / subgroupStride;
+  int64_t subgroupBasis = (subgroup == 0) ? 1 : subgroup;
+
+  partialReductionTileSizes[reductionDim] = partialReductionSize;
+  threadTileSizes[reductionDim] = threadLoads;
+  threadCounts[reductionDim] = threadBasis;
+  subGroupCounts[reductionDim] = subgroupBasis;
+
+  ArrayAttr subgroupBasisAttr = b.getArrayAttr(
+      {b.getI64ArrayAttr(subGroupCounts), b.getI64ArrayAttr(mapping)});
+
+  ArrayAttr threadBasisAttr = b.getArrayAttr(
+      {b.getI64ArrayAttr(threadCounts), b.getI64ArrayAttr(mapping)});
+
+  NamedAttribute configAttrs[] = {
+      NamedAttribute("workgroup", b.getI64ArrayAttr(workgroupTileSizes)),
+      NamedAttribute("partial_reduction",
+                     b.getI64ArrayAttr(partialReductionTileSizes)),
+      NamedAttribute("thread", b.getI64ArrayAttr(threadTileSizes)),
+      NamedAttribute("lane_basis", threadBasisAttr),
+      NamedAttribute("subgroup_basis", subgroupBasisAttr)};
+
+  auto configDict = b.getDictionaryAttr(configAttrs);
+  auto loweringConfig = IREE::GPU::LoweringConfigAttr::get(context, configDict);
+  setLoweringConfig(op, loweringConfig);
+
+  // Set the translation info
+  auto pipelineOptions = IREE::GPU::GPUPipelineOptionsAttr::get(context);
+  SmallVector<NamedAttribute, 1> pipelineAttrs = {NamedAttribute(
+      IREE::GPU::GPUPipelineOptionsAttr::getDictKeyName(), pipelineOptions)};
+
+  auto pipelineConfig = b.getDictionaryAttr(pipelineAttrs);
+
+  auto translationInfo = IREE::Codegen::TranslationInfoAttr::get(
+      context, CodeGenPipeline::LLVMGPUVectorDistribute, SymbolRefAttr(),
+      {workgroupSize, 1, 1}, subgroupSize, pipelineConfig);
+
+  if (clSetTunerAttr) {
+    setRootOpInfo(op);
+  }
+  return setTranslationInfo(entryPoint, translationInfo);
+}
+
 } // namespace mlir::iree_compiler::IREE::GPU
