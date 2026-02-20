@@ -16,6 +16,7 @@ ALL_SRCS = enforce_glob(
     # keep sorted
     [
         "arg_compare.mlir",
+        "arg_compare_gpu.mlir",
         "attention.mlir",
         "attention_i1_mask.mlir",
         "gather.mlir",
@@ -61,6 +62,7 @@ VMVX_SRCS = enforce_glob(
     ],
     include = ["*.mlir"],
     exclude = [
+        "arg_compare_gpu.mlir",
         "attention_i1_mask.mlir",
     ],
 )
@@ -76,6 +78,7 @@ LLVM_GPU_SRCS = enforce_glob(
     # keep sorted
     [
         "arg_compare.mlir",
+        "arg_compare_gpu.mlir",
         "gather.mlir",
         "scan.mlir",
         "scatter.mlir",
@@ -113,6 +116,7 @@ ROCM_HIP_SRCS = enforce_glob(
     # keep sorted
     [
         "arg_compare.mlir",
+        "arg_compare_gpu.mlir",
         "attention.mlir",
         "gather.mlir",
         "map_gather.mlir",

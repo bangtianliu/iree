@@ -2341,6 +2341,19 @@ static LogicalResult setRootConfig(IREE::GPU::TargetAttr target,
         LDBG() << "Sort Config";
         return IREE::GPU::setSortConfig(target, entryPointFn, sortOp);
       })
+      .Case<IREE::LinalgExt::ArgCompareOp>([&](auto argCompareOp) {
+        LDBG() << "ArgCompare Config";
+        if (clGPUEnableReductionVectorDistribution) {
+          if (succeeded(IREE::GPU::setReductionConfig(target, entryPointFn,
+                                                       argCompareOp))) {
+            LDBG() << "Vector Distribution ArgCompare Reduction Config";
+            return success();
+          }
+        }
+        // Fall back to default config if reduction distribution is not enabled
+        // or fails
+        return setRootDefaultConfig(target, entryPointFn, computeOp);
+      })
       .Case<IREE::LinalgExt::WinogradInputTransformOp,
             IREE::LinalgExt::WinogradOutputTransformOp,
             IREE::LinalgExt::WinogradFilterTransformOp>([&](auto winogradOp) {

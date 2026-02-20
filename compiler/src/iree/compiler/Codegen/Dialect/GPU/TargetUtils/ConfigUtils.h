@@ -12,6 +12,10 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 
+namespace mlir::iree_compiler::IREE::LinalgExt {
+class ArgCompareOp;
+} // namespace mlir::iree_compiler::IREE::LinalgExt
+
 namespace mlir::iree_compiler::IREE::GPU {
 
 /// Helper for setting up a data tiled multi-MMA inner_tiled config based on the
@@ -63,6 +67,11 @@ LogicalResult setSortConfig(IREE::GPU::TargetAttr target,
 LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
                                  mlir::FunctionOpInterface entryPoint,
                                  linalg::LinalgOp op);
+
+/// Overload for iree_linalg_ext.arg_compare operations.
+LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
+                                 mlir::FunctionOpInterface entryPoint,
+                                 IREE::LinalgExt::ArgCompareOp op);
 
 //===----------------------------------------------------------------------===//
 // Pass Pipeline Options
