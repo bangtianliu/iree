@@ -136,8 +136,10 @@ void LayoutInfo::propagateLayoutForward(Value val) {
         SmallVector<bool> reductionMask(rank, false);
         reductionMask[reductionDim] = true;
         VectorLayoutInterface reduceLayout = layout.project(reductionMask);
-        setLayoutIfUnset(argCompare.getResultValue(), reduceLayout);
-        setLayoutIfUnset(argCompare.getResultIndex(), reduceLayout);
+        if (reduceLayout) {
+          setLayoutIfUnset(argCompare.getResultValue(), reduceLayout);
+          setLayoutIfUnset(argCompare.getResultIndex(), reduceLayout);
+        }
         continue;
       }
       if (argCompare.getInputIndex() && argCompare.getInputIndex() == val) {
@@ -147,8 +149,10 @@ void LayoutInfo::propagateLayoutForward(Value val) {
         SmallVector<bool> reductionMask(rank, false);
         reductionMask[reductionDim] = true;
         VectorLayoutInterface reduceLayout = layout.project(reductionMask);
-        setLayoutIfUnset(argCompare.getResultValue(), reduceLayout);
-        setLayoutIfUnset(argCompare.getResultIndex(), reduceLayout);
+        if (reduceLayout) {
+          setLayoutIfUnset(argCompare.getResultValue(), reduceLayout);
+          setLayoutIfUnset(argCompare.getResultIndex(), reduceLayout);
+        }
         continue;
       }
       if (argCompare.getInitValue() == val) {

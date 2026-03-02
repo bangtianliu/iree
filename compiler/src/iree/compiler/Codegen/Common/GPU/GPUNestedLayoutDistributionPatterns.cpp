@@ -316,7 +316,7 @@ struct DistributeTransferRead final
     }
 
     NestedLayoutAttr vectorLayout =
-        dyn_cast<NestedLayoutAttr>(signature[resultVector]);
+        dyn_cast_if_present<NestedLayoutAttr>(signature[resultVector]);
     if (!vectorLayout) {
       return rewriter.notifyMatchFailure(readOp,
                                          "non-nested transfer_read layout");
@@ -325,7 +325,7 @@ struct DistributeTransferRead final
     VectorValue mask = readOp.getMask();
     NestedLayoutAttr maskLayout;
     if (mask) {
-      maskLayout = dyn_cast<NestedLayoutAttr>(signature[mask]);
+      maskLayout = dyn_cast_if_present<NestedLayoutAttr>(signature[mask]);
       if (!maskLayout) {
         return rewriter.notifyMatchFailure(readOp,
                                            "non-nested mask vector layout");
@@ -504,7 +504,7 @@ struct DistributeTransferWrite final
     }
 
     NestedLayoutAttr vectorLayout =
-        dyn_cast<NestedLayoutAttr>(signature[cast<VectorValue>(valueToStore)]);
+        dyn_cast_if_present<NestedLayoutAttr>(signature[cast<VectorValue>(valueToStore)]);
     if (!vectorLayout) {
       return rewriter.notifyMatchFailure(writeOp,
                                          "non-nested transfer_write layout");
@@ -518,7 +518,7 @@ struct DistributeTransferWrite final
     VectorValue mask = writeOp.getMask();
     NestedLayoutAttr maskLayout;
     if (mask) {
-      maskLayout = dyn_cast<NestedLayoutAttr>(signature[mask]);
+      maskLayout = dyn_cast_if_present<NestedLayoutAttr>(signature[mask]);
       if (!maskLayout) {
         return rewriter.notifyMatchFailure(writeOp,
                                            "non-nested mask vector layout");
@@ -618,7 +618,7 @@ struct DistributeTransferGather final
                                 PatternRewriter &rewriter) const override {
 
     NestedLayoutAttr vectorLayout =
-        dyn_cast<NestedLayoutAttr>(signature[gatherOp.getResult()]);
+        dyn_cast_if_present<NestedLayoutAttr>(signature[gatherOp.getResult()]);
     if (!vectorLayout) {
       return rewriter.notifyMatchFailure(gatherOp,
                                          "non-nested transfer_gather layout");
@@ -628,7 +628,7 @@ struct DistributeTransferGather final
     SmallVector<VectorValue> disIndexVecs;
     for (Value indexVec : gatherOp.getIndexVecs()) {
       auto vec = cast<VectorValue>(indexVec);
-      NestedLayoutAttr layout = dyn_cast<NestedLayoutAttr>(signature[vec]);
+      NestedLayoutAttr layout = dyn_cast_if_present<NestedLayoutAttr>(signature[vec]);
       if (!layout) {
         return rewriter.notifyMatchFailure(gatherOp,
                                            "non-nested index vec layout");
@@ -642,7 +642,7 @@ struct DistributeTransferGather final
     VectorValue mask = gatherOp.getMask();
     NestedLayoutAttr maskLayout;
     if (mask) {
-      maskLayout = dyn_cast<NestedLayoutAttr>(signature[mask]);
+      maskLayout = dyn_cast_if_present<NestedLayoutAttr>(signature[mask]);
       if (!maskLayout) {
         return rewriter.notifyMatchFailure(gatherOp,
                                            "non-nested mask vector layout");
@@ -781,7 +781,7 @@ struct DistributeMapScatter final
       return rewriter.notifyMatchFailure(mapScatterOp, "input is not a vector");
     }
     NestedLayoutAttr vectorLayout =
-        dyn_cast<NestedLayoutAttr>(signature[input]);
+        dyn_cast_if_present<NestedLayoutAttr>(signature[input]);
     if (!vectorLayout) {
       return rewriter.notifyMatchFailure(mapScatterOp,
                                          "non-nested map_scatter layout");
@@ -901,7 +901,7 @@ struct DistributeBroadcast final : OpDistributionPattern<vector::BroadcastOp> {
                                 DistributionSignature &signature,
                                 PatternRewriter &rewriter) const override {
     VectorValue dstVector = broadcastOp.getVector();
-    auto vectorLayout = dyn_cast<NestedLayoutAttr>(signature[dstVector]);
+    auto vectorLayout = dyn_cast_if_present<NestedLayoutAttr>(signature[dstVector]);
     if (!vectorLayout) {
       return rewriter.notifyMatchFailure(broadcastOp,
                                          "non-nested result vector layout");
@@ -935,7 +935,7 @@ struct DistributeBroadcast final : OpDistributionPattern<vector::BroadcastOp> {
 
     Value distSource = broadcastOp.getSource();
     if (srcVector && isNonZeroRank(srcVector)) {
-      auto sourceLayout = dyn_cast<NestedLayoutAttr>(signature[srcVector]);
+      auto sourceLayout = dyn_cast_if_present<NestedLayoutAttr>(signature[srcVector]);
       if (!sourceLayout) {
         return rewriter.notifyMatchFailure(broadcastOp,
                                            "non-nested source vector layout");
@@ -1434,19 +1434,19 @@ struct DistributeContract final
           contractOp, "iree.gpu.mma intrinsic attribute exists");
     }
 
-    auto lhsLayout = dyn_cast<NestedLayoutAttr>(signature[contractOp.getLhs()]);
+    auto lhsLayout = dyn_cast_if_present<NestedLayoutAttr>(signature[contractOp.getLhs()]);
     if (!lhsLayout) {
       return rewriter.notifyMatchFailure(
           contractOp, "missing nested layout for contraction lhs");
     }
-    auto rhsLayout = dyn_cast<NestedLayoutAttr>(signature[contractOp.getRhs()]);
+    auto rhsLayout = dyn_cast_if_present<NestedLayoutAttr>(signature[contractOp.getRhs()]);
     if (!rhsLayout) {
       return rewriter.notifyMatchFailure(
           contractOp, "missing nested layout for contraction rhs");
     }
     NestedLayoutAttr resLayout;
     if (auto contractRes = dyn_cast<VectorValue>(contractOp.getResult())) {
-      resLayout = dyn_cast<NestedLayoutAttr>(signature[contractRes]);
+      resLayout = dyn_cast_if_present<NestedLayoutAttr>(signature[contractRes]);
     } else {
       // Create a zero-d layout because we
       // are going to add reduction dims
@@ -1655,7 +1655,7 @@ struct DistributeTranspose final : OpDistributionPattern<vector::TransposeOp> {
                                 DistributionSignature &signature,
                                 PatternRewriter &rewriter) const override {
     VectorValue value = transposeOp.getVector();
-    VectorLayoutInterface layout = dyn_cast<NestedLayoutAttr>(signature[value]);
+    VectorLayoutInterface layout = dyn_cast_if_present<NestedLayoutAttr>(signature[value]);
     if (!layout) {
       return rewriter.notifyMatchFailure(transposeOp,
                                          "layout must be NestedLayoutAttr");
@@ -1712,8 +1712,8 @@ struct DistributeBatchOuterToLayoutConversions final
     Location loc = toLayoutOp.getLoc();
     auto input = cast<VectorValue>(toLayoutOp.getInput());
     auto output = cast<VectorValue>(toLayoutOp.getOutput());
-    auto layoutA = dyn_cast<NestedLayoutAttr>(signature[input]);
-    auto layoutB = dyn_cast<NestedLayoutAttr>(signature[output]);
+    auto layoutA = dyn_cast_if_present<NestedLayoutAttr>(signature[input]);
+    auto layoutB = dyn_cast_if_present<NestedLayoutAttr>(signature[output]);
 
     if (!layoutA || !layoutB) {
       return rewriter.notifyMatchFailure(toLayoutOp, "non-nested layout");
@@ -1942,7 +1942,7 @@ struct DistributeStep final : OpDistributionPattern<vector::StepOp> {
     Location loc = stepOp.getLoc();
     VectorValue result = stepOp.getResult();
     NestedLayoutAttr resultLayout =
-        dyn_cast<NestedLayoutAttr>(signature[result]);
+        dyn_cast_if_present<NestedLayoutAttr>(signature[result]);
     if (!resultLayout) {
       return rewriter.notifyMatchFailure(
           stepOp, "missing nested layout for step op result");
@@ -2123,7 +2123,7 @@ struct DistributeCreateMask final
     Location loc = maskOp.getLoc();
     VectorValue result = maskOp.getResult();
     NestedLayoutAttr resultLayout =
-        dyn_cast<NestedLayoutAttr>(signature[result]);
+        dyn_cast_if_present<NestedLayoutAttr>(signature[result]);
     if (!resultLayout) {
       return rewriter.notifyMatchFailure(
           maskOp, "missing nested layout for step op result");
@@ -2168,7 +2168,7 @@ struct DistributeConstantMask final
     Location loc = maskOp.getLoc();
     VectorValue result = maskOp.getResult();
     NestedLayoutAttr resultLayout =
-        dyn_cast<NestedLayoutAttr>(signature[result]);
+        dyn_cast_if_present<NestedLayoutAttr>(signature[result]);
     if (!resultLayout) {
       return rewriter.notifyMatchFailure(
           maskOp, "missing nested layout for step op result");
@@ -3263,10 +3263,16 @@ struct DistributeArgCompare final
     // Set signatures for operands and results
     // Only non-0D vector operands need layouts. The init values are 0-D vectors (scalars)
     // and should not have layouts. We only pass layouts for the input_value and input_index.
-    // Results are also 0-D vectors, so they don't need layouts either.
+    SmallVector<VectorLayoutInterface> resultLayouts;
+    if (resValLayout) {
+      resultLayouts.push_back(resValLayout);
+    }
+    if (resIdxLayout) {
+      resultLayouts.push_back(resIdxLayout);
+    }
     setSignatureForRedistribution(rewriter, secondReduction,
                                   {readLayout, readLayout},
-                                  {});
+                                  resultLayouts);
 
     return std::make_pair(secondReduction.getResultValue(),
                          secondReduction.getResultIndex());
