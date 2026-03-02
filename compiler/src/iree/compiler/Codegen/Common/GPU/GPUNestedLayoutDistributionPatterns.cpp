@@ -2843,24 +2843,19 @@ struct DistributeArgCompare final
           amdgpu::DPPPerm::row_mirror,
           /*permArgument=*/rewriter.getUnitAttr(),
           /*row_mask=*/allRows, /*bank_mask=*/allBanks, /*bound_ctrl=*/true);
+    // Note: XOR 16 and XOR 32 cannot be efficiently implemented with DPP
+    // row_bcast operations for custom comparators because row_bcast is a
+    // broadcast, not an exchange. The row_bcast approach only works for
+    // commutative reductions where we can use ReadlaneOp to get the final
+    // result from a specific lane. For custom comparators where we need
+    // all lanes to have the winning value (for ballot), we fall back to
+    // gpu::ShuffleOp which uses ds_bpermute.
     case 16:
-      // For XOR 16: use row_bcast_15 with row_mask=0xa.
-      // row_bcast_15 broadcasts lane 15 of each row to the next row.
-      // row_mask=0xa (binary 1010) selects rows 1 and 3 for writing,
-      // which achieves the lane XOR 16 pattern.
-      return amdgpu::DPPOp::create(
-          rewriter, loc, src.getType(), /*old=*/src, /*src=*/src,
-          amdgpu::DPPPerm::row_bcast_15,
-          /*permArgument=*/rewriter.getUnitAttr(),
-          /*row_mask=*/0xa, /*bank_mask=*/allBanks, /*bound_ctrl=*/false);
     case 32:
-      return amdgpu::DPPOp::create(
-          rewriter, loc, src.getType(), /*old=*/src, /*src=*/src,
-          amdgpu::DPPPerm::row_bcast_31,
-          /*permArgument=*/rewriter.getUnitAttr(),
-          /*row_mask=*/allRows, /*bank_mask=*/allBanks, /*bound_ctrl=*/true);
+      // Fall back to ShuffleOp for these offsets.
+      return nullptr;
     default:
-      // Fall back to nullptr for unsupported offsets
+      // Fall back to nullptr for unsupported offsets.
       return nullptr;
     }
   }
@@ -2939,11 +2934,11 @@ struct DistributeArgCompare final
             int64_t shuffleOffset = offset * (1 << stage);
 
             // Try to use DPP for the shuffle (much faster than ds_bpermute).
-            // createDPPShuffleXOR returns nullptr for unsupported offsets.
+            // Returns nullptr for unsupported offsets.
             Value shuffledVal = createDPPShuffleXOR(rewriter, loc, currentVal,
                                                     shuffleOffset);
             if (!shuffledVal) {
-              // Fall back to ShuffleOp for unsupported offsets
+              // Fall back to ShuffleOp for unsupported offsets.
               Value shuffleOffset32 = arith::ConstantOp::create(
                   rewriter, loc, rewriter.getIntegerAttr(i32Type, shuffleOffset));
               shuffledVal =
