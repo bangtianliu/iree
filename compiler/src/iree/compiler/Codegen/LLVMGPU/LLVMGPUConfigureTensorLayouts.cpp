@@ -10,6 +10,11 @@
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "llvm/Support/Debug.h"
+#include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/PatternMatch.h"
@@ -484,6 +489,117 @@ static LogicalResult setGPULoweringConfigLayout(
   return success();
 }
 
+static LogicalResult setGPULoweringConfigLayoutForArgCompare(
+    IREE::GPU::LoweringConfigAttr config,
+    IREE::LinalgExt::ArgCompareOp argCompareOp, ArrayRef<int64_t> workgroupSize,
+    RewriterBase &rewriter) {
+  MLIRContext *context = config.getContext();
+  Location loc = argCompareOp.getLoc();
+
+  SmallVector<int64_t> bounds = argCompareOp.getStaticLoopRanges();
+
+  // Subgroup distribution layouts.
+  SmallVector<int64_t> subgroupSizes, subgroupStrides;
+  if (failed(distributeTilingSizes(argCompareOp, config,
+                                   IREE::GPU::TilingLevel::Subgroup, bounds,
+                                   subgroupSizes, subgroupStrides))) {
+    return failure();
+  }
+
+  // Thread distribution layouts.
+  SmallVector<int64_t> threadSizes, threadStrides;
+  if (failed(distributeTilingSizes(argCompareOp, config,
+                                   IREE::GPU::TilingLevel::Thread, bounds,
+                                   threadSizes, threadStrides))) {
+    return failure();
+  }
+
+  // Use thread tile sizes as the vector width for each thread.
+  SmallVector<int64_t> threadTileSizes = config.getStaticTilingLevelSizes(
+      llvm::to_underlying(IREE::GPU::TilingLevel::Thread), argCompareOp);
+  FailureOr<SmallVector<int64_t>> elementTile =
+      divideTile(bounds, threadTileSizes);
+  if (failed(elementTile)) {
+    argCompareOp->emitError()
+        << "Could not divide bounds over given thread tile.";
+    return failure();
+  }
+  // The remaining bounds become batch sizes.
+  ArrayRef<int64_t> batchTile = bounds;
+  SmallVector<int64_t> outerTile(bounds.size(), 1);
+
+  auto layout = IREE::VectorExt::NestedLayoutAttr::get(
+      context, subgroupSizes, batchTile, outerTile, threadSizes,
+      elementTile.value(), subgroupStrides, threadStrides);
+
+  SmallVector<bool> promotedOperands = getPromotedOperands(argCompareOp);
+
+  SmallVector<AffineMap> operandMaps =
+      argCompareOp.getIndexingMapsForOperands();
+  SmallVector<AffineMap> resultMaps = argCompareOp.getIndexingMapsForResults();
+
+  // Apply layouts to all operands.
+  rewriter.setInsertionPoint(argCompareOp);
+  for (auto [idx, operand] : llvm::enumerate(argCompareOp->getOpOperands())) {
+    VectorLayoutInterface operandLayout = layout.apply(operandMaps[idx]);
+    auto toLayout =
+        ToLayoutOp::create(rewriter, loc, operand.get(), operandLayout);
+    toLayout.setSharedMemoryConversion(promotedOperands[idx]);
+    operand.set(toLayout);
+  }
+
+  // Apply layouts to all results.
+  rewriter.setInsertionPointAfter(argCompareOp);
+  for (auto [idx, result] : llvm::enumerate(argCompareOp->getResults())) {
+    VectorLayoutInterface resultLayout = layout.apply(resultMaps[idx]);
+    auto toLayout = ToLayoutOp::create(rewriter, loc, result, resultLayout);
+    rewriter.replaceAllUsesExcept(result, toLayout, toLayout);
+  }
+
+  return success();
+}
+
+/// Infer layout by tracing through scf.for loop boundaries.
+/// Handles values that flow through scf.for iter_args and yields:
+///   %result = scf.for ... iter_args(%arg = ...) {
+///     %laid_out = to_layout %something
+///     scf.yield %laid_out
+///   }
+/// Recursively traces through nested loops and yields to find to_layout ops.
+static IREE::VectorExt::VectorLayoutInterface
+inferLayoutFromScfFor(Value value) {
+  // Base case: value is directly from to_layout.
+  if (auto toLayoutOp = value.getDefiningOp<IREE::VectorExt::ToLayoutOp>()) {
+    return toLayoutOp.getLayout();
+  }
+
+  OpOperand *yieldOperand = nullptr;
+
+  if (auto forOp = value.getDefiningOp<scf::ForOp>()) {
+    // Value is a loop result - trace to its iter_arg and yield operand.
+    OpResult result = cast<OpResult>(value);
+    BlockArgument iterArg = forOp.getTiedLoopRegionIterArg(result);
+    if (!iterArg) {
+      return nullptr;
+    }
+    yieldOperand = forOp.getTiedLoopYieldedValue(iterArg);
+  } else if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+    // Value is an iter_arg - trace to its yield operand.
+    Operation *parentOp = blockArg.getOwner()->getParentOp();
+    auto forOp = dyn_cast<scf::ForOp>(parentOp);
+    if (!forOp) {
+      return nullptr;
+    }
+    yieldOperand = forOp.getTiedLoopYieldedValue(blockArg);
+  }
+
+  if (!yieldOperand) {
+    return nullptr;
+  }
+  // Recursively trace through the yielded value.
+  return inferLayoutFromScfFor(yieldOperand->get());
+}
+
 struct LLVMGPUConfigureTensorLayoutsPass final
     : impl::LLVMGPUConfigureTensorLayoutsPassBase<
           LLVMGPUConfigureTensorLayoutsPass> {
@@ -541,6 +657,82 @@ struct LLVMGPUConfigureTensorLayoutsPass final
 
       if (failed(result)) {
         return failure();
+      }
+    }
+
+    // Handle IREE::LinalgExt::ArgCompareOp operations.
+    // ArgCompare ops don't have their own lowering_config, but their operands
+    // may already have layouts from previous operations (like linalg.generic).
+    // We need to propagate those layouts through the arg_compare.
+    SmallVector<IREE::LinalgExt::ArgCompareOp> argCompareCandidates;
+    funcOp->walk([&](IREE::LinalgExt::ArgCompareOp op) {
+      argCompareCandidates.push_back(op);
+    });
+
+    for (IREE::LinalgExt::ArgCompareOp candidate : argCompareCandidates) {
+      // Check if this arg_compare has a lowering_config.
+      auto config = getLoweringConfig<IREE::GPU::LoweringConfigAttr>(
+          candidate.getOperation());
+      if (config) {
+        // This arg_compare has a lowering config, use it to set layouts.
+        if (failed(setGPULoweringConfigLayoutForArgCompare(
+                config, candidate, workgroupSize, rewriter))) {
+          return failure();
+        }
+        continue;
+      }
+
+      // Propagate layouts from neighboring operations.
+      // Three strategies in priority order:
+      // 1. tensor.insert_slice sources (direct data flow)
+      // 2. Sibling users of the same value (shared operand)
+      // 3. scf.for loops (cross-loop boundary)
+      rewriter.setInsertionPoint(candidate);
+
+      for (OpOperand &operand : candidate->getOpOperands()) {
+        if (operand.get().getDefiningOp<IREE::VectorExt::ToLayoutOp>()) {
+          continue;
+        }
+
+        Value operandValue = operand.get();
+        IREE::VectorExt::VectorLayoutInterface layoutToPropagate = nullptr;
+
+        // Strategy 1: Propagate from tensor.insert_slice source.
+        if (auto insertSlice =
+                operandValue.getDefiningOp<tensor::InsertSliceOp>()) {
+          Value source = insertSlice.getSource();
+          if (auto sourceLayout =
+                  source.getDefiningOp<IREE::VectorExt::ToLayoutOp>()) {
+            layoutToPropagate = sourceLayout.getLayout();
+          }
+        }
+
+        // Strategy 2: Propagate from sibling users.
+        if (!layoutToPropagate) {
+          for (Operation *user : operandValue.getUsers()) {
+            if (auto toLayout = dyn_cast<IREE::VectorExt::ToLayoutOp>(user)) {
+              layoutToPropagate = toLayout.getLayout();
+              break;
+            }
+          }
+        }
+
+        // Strategy 3: Propagate through scf.for loops.
+        if (!layoutToPropagate) {
+          layoutToPropagate = inferLayoutFromScfFor(operandValue);
+        }
+
+        if (layoutToPropagate) {
+          LLVM_DEBUG({
+            llvm::dbgs() << "Propagating layout " << layoutToPropagate << " to "
+                         << candidate->getName() << " operand #"
+                         << operand.getOperandNumber() << "\n";
+          });
+          rewriter.setInsertionPoint(candidate);
+          auto newToLayout = IREE::VectorExt::ToLayoutOp::create(
+              rewriter, candidate.getLoc(), operandValue, layoutToPropagate);
+          operand.set(newToLayout);
+        }
       }
     }
 
