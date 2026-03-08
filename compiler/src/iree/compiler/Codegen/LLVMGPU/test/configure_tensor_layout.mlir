@@ -420,3 +420,54 @@ func.func @contraction_ceildiv_batch(%lhs: tensor<1x1x63xf16>,
 // CHECK-DAG: %[[RHS:.+]] = iree_vector_ext.to_layout %{{.*}} to layout(#[[$NESTED1]])
 // CHECK: linalg.generic
 // CHECK-SAME: ins(%[[LHS]], %[[RHS]]
+
+// -----
+
+// Test arg_compare with explicit lowering_config.
+
+#translation_with_config = #iree_codegen.translation_info<pipeline = LLVMGPUVectorDistribute
+                                              workgroup_size = [64, 1, 1]
+                                              subgroup_size = 64>
+
+#lowering_config_argcompare = #iree_gpu.lowering_config<{
+    workgroup = [1, 1, 0],
+    partial_reduction = [0, 0, 16],
+    thread = [1, 1, 4],
+    lane_basis = [[1, 1, 4], [0, 1, 2]],
+    subgroup_basis = [[1, 1, 1], [0, 1, 2]]
+}>
+
+func.func @argcompare_with_lowering_config(%input: tensor<16x16x16xf16>)
+    -> (tensor<16x16xf16>, tensor<16x16xi32>)
+    attributes { translation_info = #translation_with_config } {
+  %init_val = tensor.empty() : tensor<16x16xf16>
+  %init_idx = tensor.empty() : tensor<16x16xi32>
+
+  %result:2 = iree_linalg_ext.arg_compare {
+      lowering_config = #lowering_config_argcompare
+    }
+      dimension(2)
+      ins(%input : tensor<16x16x16xf16>)
+      outs(%init_val, %init_idx : tensor<16x16xf16>, tensor<16x16xi32>) {
+    ^bb0(%lhs: f16, %rhs: f16):
+      %cmp = arith.cmpf ogt, %lhs, %rhs : f16
+      iree_linalg_ext.yield %cmp : i1
+  } -> tensor<16x16xf16>, tensor<16x16xi32>
+
+  return %result#0, %result#1 : tensor<16x16xf16>, tensor<16x16xi32>
+}
+
+// Verify layouts are applied to all operands and results.
+// CHECK-LABEL: func.func @argcompare_with_lowering_config
+// CHECK: %[[EMPTY0:.+]] = tensor.empty() : tensor<16x16xf16>
+// CHECK: %[[EMPTY1:.+]] = tensor.empty() : tensor<16x16xi32>
+// CHECK: %[[IN_LAYOUT:.+]] = iree_vector_ext.to_layout %{{.+}} to layout(#{{.+}}) : tensor<16x16x16xf16>
+// CHECK: %[[OUT0_LAYOUT:.+]] = iree_vector_ext.to_layout %[[EMPTY0]] to layout(#{{.+}}) : tensor<16x16xf16>
+// CHECK: %[[OUT1_LAYOUT:.+]] = iree_vector_ext.to_layout %[[EMPTY1]] to layout(#{{.+}}) : tensor<16x16xi32>
+// CHECK: %[[RESULT:.+]]:2 = iree_linalg_ext.arg_compare
+// CHECK-SAME: lowering_config
+// CHECK-SAME: dimension(2)
+// CHECK-SAME: ins(%[[IN_LAYOUT]] : tensor<16x16x16xf16>)
+// CHECK-SAME: outs(%[[OUT0_LAYOUT]], %[[OUT1_LAYOUT]] : tensor<16x16xf16>, tensor<16x16xi32>)
+// CHECK: iree_vector_ext.to_layout %[[RESULT]]#0
+// CHECK: iree_vector_ext.to_layout %[[RESULT]]#1

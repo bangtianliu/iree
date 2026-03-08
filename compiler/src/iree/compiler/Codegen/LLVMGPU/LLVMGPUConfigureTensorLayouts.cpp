@@ -10,6 +10,7 @@
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/PatternMatch.h"
@@ -484,6 +485,76 @@ static LogicalResult setGPULoweringConfigLayout(
   return success();
 }
 
+static LogicalResult setGPULoweringConfigLayoutForArgCompare(
+    IREE::GPU::LoweringConfigAttr config,
+    IREE::LinalgExt::ArgCompareOp argCompareOp, ArrayRef<int64_t> workgroupSize,
+    RewriterBase &rewriter) {
+  MLIRContext *context = config.getContext();
+  Location loc = argCompareOp.getLoc();
+
+  SmallVector<int64_t> bounds = argCompareOp.getStaticLoopRanges();
+
+  // Subgroup distribution layouts.
+  SmallVector<int64_t> subgroupSizes, subgroupStrides;
+  if (failed(distributeTilingSizes(argCompareOp, config,
+                                   IREE::GPU::TilingLevel::Subgroup, bounds,
+                                   subgroupSizes, subgroupStrides))) {
+    return failure();
+  }
+
+  // Thread distribution layouts.
+  SmallVector<int64_t> threadSizes, threadStrides;
+  if (failed(distributeTilingSizes(argCompareOp, config,
+                                   IREE::GPU::TilingLevel::Thread, bounds,
+                                   threadSizes, threadStrides))) {
+    return failure();
+  }
+
+  // Use thread tile sizes as the vector width for each thread.
+  SmallVector<int64_t> threadTileSizes = config.getStaticTilingLevelSizes(
+      llvm::to_underlying(IREE::GPU::TilingLevel::Thread), argCompareOp);
+  FailureOr<SmallVector<int64_t>> elementTile =
+      divideTile(bounds, threadTileSizes);
+  if (failed(elementTile)) {
+    argCompareOp->emitError()
+        << "Could not divide bounds over given thread tile.";
+    return failure();
+  }
+  // The remaining bounds become batch sizes.
+  ArrayRef<int64_t> batchTile = bounds;
+  SmallVector<int64_t> outerTile(bounds.size(), 1);
+
+  auto layout = IREE::VectorExt::NestedLayoutAttr::get(
+      context, subgroupSizes, batchTile, outerTile, threadSizes,
+      elementTile.value(), subgroupStrides, threadStrides);
+
+  SmallVector<bool> promotedOperands = getPromotedOperands(argCompareOp);
+
+  SmallVector<AffineMap> operandMaps =
+      argCompareOp.getIndexingMapsForOperands();
+  SmallVector<AffineMap> resultMaps = argCompareOp.getIndexingMapsForResults();
+
+  // Apply layouts to all operands.
+  rewriter.setInsertionPoint(argCompareOp);
+  for (auto [idx, operand] : llvm::enumerate(argCompareOp->getOpOperands())) {
+    VectorLayoutInterface operandLayout = layout.apply(operandMaps[idx]);
+    auto toLayout =
+        ToLayoutOp::create(rewriter, loc, operand.get(), operandLayout);
+    toLayout.setSharedMemoryConversion(promotedOperands[idx]);
+    operand.set(toLayout);
+  }
+
+  // Apply layouts to all results.
+  rewriter.setInsertionPointAfter(argCompareOp);
+  for (auto [idx, result] : llvm::enumerate(argCompareOp->getResults())) {
+    VectorLayoutInterface resultLayout = layout.apply(resultMaps[idx]);
+    auto toLayout = ToLayoutOp::create(rewriter, loc, result, resultLayout);
+    rewriter.replaceAllUsesExcept(result, toLayout, toLayout);
+  }
+
+  return success();
+}
+
 struct LLVMGPUConfigureTensorLayoutsPass final
     : impl::LLVMGPUConfigureTensorLayoutsPassBase<
           LLVMGPUConfigureTensorLayoutsPass> {
@@ -540,6 +611,27 @@ struct LLVMGPUConfigureTensorLayoutsPass final
               .Default(failure());
 
       if (failed(result)) {
+        return failure();
+      }
+    }
+
+    // Handle IREE::LinalgExt::ArgCompareOp operations with lowering_config.
+    SmallVector<IREE::LinalgExt::ArgCompareOp> argCompareCandidates;
+    funcOp->walk([&](IREE::LinalgExt::ArgCompareOp op) {
+      if (getLoweringConfig(op)) {
+        argCompareCandidates.push_back(op);
+      }
+    });
+
+    for (IREE::LinalgExt::ArgCompareOp candidate : argCompareCandidates) {
+      auto config = getLoweringConfig<IREE::GPU::LoweringConfigAttr>(
+          candidate.getOperation());
+      if (!config) {
+        // Config exists but isn't the expected GPU lowering config type.
+        continue;
+      }
+      if (failed(setGPULoweringConfigLayoutForArgCompare(
+              config, candidate, workgroupSize, rewriter))) {
         return failure();
       }
     }
