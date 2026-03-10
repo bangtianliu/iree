@@ -8,9 +8,9 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/GPULoweringConfigUtils.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
-#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -630,17 +630,15 @@ static LogicalResult setGPULoweringConfigLayoutForArgCompare(
 
   // Subgroup distribution layouts.
   SmallVector<int64_t> subgroupSizes, subgroupStrides;
-  if (failed(distributeTilingSizes(op, config,
-                                   IREE::GPU::TilingLevel::Subgroup, bounds,
-                                   subgroupSizes, subgroupStrides))) {
+  if (failed(distributeTilingSizes(op, config, IREE::GPU::TilingLevel::Subgroup,
+                                   bounds, subgroupSizes, subgroupStrides))) {
     return failure();
   }
 
   // Thread distribution layouts.
   SmallVector<int64_t> threadSizes, threadStrides;
-  if (failed(distributeTilingSizes(op, config,
-                                   IREE::GPU::TilingLevel::Thread, bounds,
-                                   threadSizes, threadStrides))) {
+  if (failed(distributeTilingSizes(op, config, IREE::GPU::TilingLevel::Thread,
+                                   bounds, threadSizes, threadStrides))) {
     return failure();
   }
 
@@ -664,7 +662,8 @@ static LogicalResult setGPULoweringConfigLayoutForArgCompare(
   SmallVector<bool> promotedOperands = getPromotedOperands(op);
 
   // Get indexing maps for operands and results
-  SmallVector<AffineMap> operandMaps = argCompareOp.getIndexingMapsForOperands();
+  SmallVector<AffineMap> operandMaps =
+      argCompareOp.getIndexingMapsForOperands();
   SmallVector<AffineMap> resultMaps = argCompareOp.getIndexingMapsForResults();
 
   // Set layouts for operands (input_value, optionally input_index, init_value,
@@ -808,7 +807,8 @@ struct LLVMGPUConfigureTensorLayoutsPass final
 
     for (IREE::LinalgExt::ArgCompareOp candidate : argCompareCandidates) {
       // Check if this arg_compare has a lowering_config
-      auto config = getLoweringConfig<IREE::GPU::LoweringConfigAttr>(candidate.getOperation());
+      auto config = getLoweringConfig<IREE::GPU::LoweringConfigAttr>(
+          candidate.getOperation());
       if (config) {
         // This arg_compare has a lowering config, use it to set layouts
         if (failed(setGPULoweringConfigLayoutForArgCompare(
@@ -833,10 +833,13 @@ struct LLVMGPUConfigureTensorLayoutsPass final
         IREE::VectorExt::VectorLayoutInterface layoutToPropagate = nullptr;
 
         // Strategy 1: Check if the operand is from tensor.insert_slice
-        // whose source has a to_layout (layouts are often lost through insert_slice)
-        if (auto insertSlice = operandValue.getDefiningOp<tensor::InsertSliceOp>()) {
+        // whose source has a to_layout (layouts are often lost through
+        // insert_slice)
+        if (auto insertSlice =
+                operandValue.getDefiningOp<tensor::InsertSliceOp>()) {
           Value source = insertSlice.getSource();
-          if (auto sourceLayout = source.getDefiningOp<IREE::VectorExt::ToLayoutOp>()) {
+          if (auto sourceLayout =
+                  source.getDefiningOp<IREE::VectorExt::ToLayoutOp>()) {
             // The source has a layout, propagate it
             layoutToPropagate = sourceLayout.getLayout();
           }

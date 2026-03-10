@@ -63,31 +63,26 @@ namespace {
 static LogicalResult setArgCompareAnchors(mlir::FunctionOpInterface funcOp,
                                           IRRewriter &rewriter,
                                           int64_t subgroupSize) {
-  fprintf(stderr, "\n========== setArgCompareAnchors: Starting ==========\n");
-  fflush(stderr);
   SmallVector<IREE::VectorExt::ArgCompareOp> argCompareOps;
-  funcOp->walk([&](IREE::VectorExt::ArgCompareOp op) {
-    argCompareOps.push_back(op);
-    fprintf(stderr, "  Found arg_compare op\n");
-    fflush(stderr);
-  });
-
-  fprintf(stderr, "  Total arg_compare ops found: %zu\n", argCompareOps.size());
-  fflush(stderr);
+  funcOp->walk(
+      [&](IREE::VectorExt::ArgCompareOp op) { argCompareOps.push_back(op); });
 
   if (argCompareOps.empty()) {
-    fprintf(stderr, "  No arg_compare ops found - returning success\n");
-    fflush(stderr);
     return success();
   }
 
+  LLVM_DEBUG(llvm::dbgs() << "setArgCompareAnchors: found "
+                          << argCompareOps.size() << " ops\n");
+
   for (auto argCompareOp : argCompareOps) {
-    fprintf(stderr, "  Processing arg_compare op\n");
-    fflush(stderr);
     // Get the reduction dimension
     int64_t reductionDim = argCompareOp.getDimension();
-    fprintf(stderr, "    Reduction dimension: %lld\n", (long long)reductionDim);
-    fflush(stderr);
+
+    LLVM_DEBUG(llvm::dbgs() << "Processing ArgCompare: inputRank="
+                            << argCompareOp.getInputValue().getType().getRank()
+                            << ", initRank="
+                            << argCompareOp.getInitValue().getType().getRank()
+                            << ", reductionDim=" << reductionDim << "\n");
 
     // Get vector types for inputs
     TypedValue<VectorType> inputValue = argCompareOp.getInputValue();
@@ -97,10 +92,17 @@ static LogicalResult setArgCompareAnchors(mlir::FunctionOpInterface funcOp,
       continue; // Skip non-vector arg_compare
     }
 
+    TypedValue<VectorType> initValue = argCompareOp.getInitValue();
+    auto initValueType = initValue.getType();
+    int64_t initRank = initValueType.getRank();
+
+    // For 0D output cases (scalar results), we still need to set anchors
+    // on the input to enable distribution. The output will use an empty layout.
+
     // Create nested layout for the input vector
     // The layout distributes the reduction dimension across threads
     SmallVector<int64_t> shape(inputValueType.getShape().begin(),
-                                inputValueType.getShape().end());
+                               inputValueType.getShape().end());
     int64_t rank = shape.size();
 
     // Initialize layout dimensions (subgroup, batch, outer, thread, element)
@@ -111,14 +113,16 @@ static LogicalResult setArgCompareAnchors(mlir::FunctionOpInterface funcOp,
     SmallVector<int64_t> elementTile(rank, 1);
 
     // Distribute the reduction dimension across threads (subgroup)
-    // If the dimension is larger than subgroupSize, use element_tile for the remainder
+    // If the dimension is larger than subgroupSize, use element_tile for the
+    // remainder
     int64_t reductionSize = shape[reductionDim];
     if (reductionSize <= subgroupSize) {
       threadTile[reductionDim] = reductionSize;
     } else {
       threadTile[reductionDim] = subgroupSize;
       // Each thread handles multiple elements
-      elementTile[reductionDim] = (reductionSize + subgroupSize - 1) / subgroupSize;
+      elementTile[reductionDim] =
+          (reductionSize + subgroupSize - 1) / subgroupSize;
     }
 
     // Set strides (subgroup and thread)
@@ -128,95 +132,90 @@ static LogicalResult setArgCompareAnchors(mlir::FunctionOpInterface funcOp,
 
     // Create the nested layout attribute
     auto inputLayout = IREE::VectorExt::NestedLayoutAttr::get(
-        rewriter.getContext(), subgroupTile, batchTile, outerTile,
-        threadTile, elementTile, subgroupStrides, threadStrides);
+        rewriter.getContext(), subgroupTile, batchTile, outerTile, threadTile,
+        elementTile, subgroupStrides, threadStrides);
 
     // Wrap input value with to_layout
+    // BUT: For 0D output cases (full reduction), the input will come from a
+    // distributed loop, so we should NOT set input anchors. The distribution
+    // infrastructure will handle the input distribution through the loop body.
+    // Only set input anchors for non-0D output cases (batched reductions).
     rewriter.setInsertionPoint(argCompareOp);
     Location loc = argCompareOp.getLoc();
 
-    auto layoutedInputValue = IREE::VectorExt::ToLayoutOp::create(
-        rewriter, loc, inputValue, inputLayout);
+    if (initRank > 0) {
+      // Batched reduction: set layout anchors on inputs
+      auto layoutedInputValue = IREE::VectorExt::ToLayoutOp::create(
+          rewriter, loc, inputValue, inputLayout);
+      argCompareOp->setOperand(0, layoutedInputValue.getResult());
 
-    // Update arg_compare operand 0 (input value)
-    argCompareOp->setOperand(0, layoutedInputValue.getResult());
-
-    // If there's an explicit input index, wrap it too
-    if (Value inputIndex = argCompareOp.getInputIndex()) {
-      auto inputIndexVec = dyn_cast<TypedValue<VectorType>>(inputIndex);
-      if (inputIndexVec) {
-        auto layoutedInputIndex = IREE::VectorExt::ToLayoutOp::create(
-            rewriter, loc, inputIndexVec, inputLayout);
-        argCompareOp->setOperand(1, layoutedInputIndex.getResult());
+      // If there's an explicit input index, wrap it too
+      if (Value inputIndex = argCompareOp.getInputIndex()) {
+        auto inputIndexVec = dyn_cast<TypedValue<VectorType>>(inputIndex);
+        if (inputIndexVec) {
+          auto layoutedInputIndex = IREE::VectorExt::ToLayoutOp::create(
+              rewriter, loc, inputIndexVec, inputLayout);
+          argCompareOp->setOperand(1, layoutedInputIndex.getResult());
+        }
       }
     }
+    // For 0D output (full reduction), skip input anchors - they'll be
+    // distributed by loop
 
-    // Wrap init value and init index with reduced-rank layout
-    TypedValue<VectorType> initValue = argCompareOp.getInitValue();
+    // Wrap init value and init index with layout
+    // This handles both non-zero rank (regular vectors) and rank-0 (scalar
+    // vectors)
     TypedValue<VectorType> initIndex = argCompareOp.getInitIndex();
 
-    auto initValueType = initValue.getType();
-    if (initValueType.getRank() > 0) {
-      SmallVector<int64_t> initShape(initValueType.getShape().begin(),
-                                      initValueType.getShape().end());
-      int64_t initRank = initShape.size();
+    // Create layout based on init rank (empty arrays for 0D vectors)
+    SmallVector<int64_t> initSubgroupTile(initRank, 1);
+    SmallVector<int64_t> initBatchTile(initRank, 1);
+    SmallVector<int64_t> initOuterTile(initRank, 1);
+    SmallVector<int64_t> initThreadTile(initRank, 1);
+    SmallVector<int64_t> initElementTile(initRank, 1);
+    SmallVector<int64_t> initSubgroupStrides(initRank, 0);
+    SmallVector<int64_t> initThreadStrides(initRank, 0);
 
-      SmallVector<int64_t> initSubgroupTile(initRank, 1);
-      SmallVector<int64_t> initBatchTile(initRank, 1);
-      SmallVector<int64_t> initOuterTile(initRank, 1);
-      SmallVector<int64_t> initThreadTile(initRank, 1);
-      SmallVector<int64_t> initElementTile(initRank, 1);
-      SmallVector<int64_t> initSubgroupStrides(initRank, 0);
-      SmallVector<int64_t> initThreadStrides(initRank, 0);
+    auto initLayout = IREE::VectorExt::NestedLayoutAttr::get(
+        rewriter.getContext(), initSubgroupTile, initBatchTile, initOuterTile,
+        initThreadTile, initElementTile, initSubgroupStrides,
+        initThreadStrides);
 
-      auto initLayout = IREE::VectorExt::NestedLayoutAttr::get(
-          rewriter.getContext(), initSubgroupTile, initBatchTile, initOuterTile,
-          initThreadTile, initElementTile, initSubgroupStrides, initThreadStrides);
+    auto layoutedInitValue = IREE::VectorExt::ToLayoutOp::create(
+        rewriter, loc, initValue, initLayout);
+    auto layoutedInitIndex = IREE::VectorExt::ToLayoutOp::create(
+        rewriter, loc, initIndex, initLayout);
 
-      auto layoutedInitValue = IREE::VectorExt::ToLayoutOp::create(
-          rewriter, loc, initValue, initLayout);
-      auto layoutedInitIndex = IREE::VectorExt::ToLayoutOp::create(
-          rewriter, loc, initIndex, initLayout);
+    // Update init operands (positions depend on whether input_index is present)
+    int initValueOperandIdx = argCompareOp.getInputIndex() ? 2 : 1;
+    int initIndexOperandIdx = initValueOperandIdx + 1;
 
-      // Update init operands (positions depend on whether input_index is present)
-      int initValueOperandIdx = argCompareOp.getInputIndex() ? 2 : 1;
-      int initIndexOperandIdx = initValueOperandIdx + 1;
-
-      argCompareOp->setOperand(initValueOperandIdx, layoutedInitValue.getResult());
-      argCompareOp->setOperand(initIndexOperandIdx, layoutedInitIndex.getResult());
-    }
+    argCompareOp->setOperand(initValueOperandIdx,
+                             layoutedInitValue.getResult());
+    argCompareOp->setOperand(initIndexOperandIdx,
+                             layoutedInitIndex.getResult());
 
     // Wrap results with the same layout as inits
     rewriter.setInsertionPointAfter(argCompareOp);
-    if (initValueType.getRank() > 0) {
-      SmallVector<int64_t> initShape(initValueType.getShape().begin(),
-                                      initValueType.getShape().end());
-      int64_t initRank = initShape.size();
 
-      SmallVector<int64_t> resultSubgroupTile(initRank, 1);
-      SmallVector<int64_t> resultBatchTile(initRank, 1);
-      SmallVector<int64_t> resultOuterTile(initRank, 1);
-      SmallVector<int64_t> resultThreadTile(initRank, 1);
-      SmallVector<int64_t> resultElementTile(initRank, 1);
-      SmallVector<int64_t> resultSubgroupStrides(initRank, 0);
-      SmallVector<int64_t> resultThreadStrides(initRank, 0);
+    // Use the same layout dimensions for results (empty for 0D, filled for
+    // non-0D)
+    auto resultLayout = IREE::VectorExt::NestedLayoutAttr::get(
+        rewriter.getContext(), initSubgroupTile, initBatchTile, initOuterTile,
+        initThreadTile, initElementTile, initSubgroupStrides,
+        initThreadStrides);
 
-      auto resultLayout = IREE::VectorExt::NestedLayoutAttr::get(
-          rewriter.getContext(), resultSubgroupTile, resultBatchTile, resultOuterTile,
-          resultThreadTile, resultElementTile, resultSubgroupStrides, resultThreadStrides);
+    auto layoutedResultValue = IREE::VectorExt::ToLayoutOp::create(
+        rewriter, loc, argCompareOp.getResult(0), resultLayout);
+    auto layoutedResultIndex = IREE::VectorExt::ToLayoutOp::create(
+        rewriter, loc, argCompareOp.getResult(1), resultLayout);
 
-      auto layoutedResultValue = IREE::VectorExt::ToLayoutOp::create(
-          rewriter, loc, argCompareOp.getResult(0), resultLayout);
-      auto layoutedResultIndex = IREE::VectorExt::ToLayoutOp::create(
-          rewriter, loc, argCompareOp.getResult(1), resultLayout);
-
-      rewriter.replaceAllUsesExcept(argCompareOp.getResult(0),
-                                    layoutedResultValue.getResult(),
-                                    layoutedResultValue);
-      rewriter.replaceAllUsesExcept(argCompareOp.getResult(1),
-                                    layoutedResultIndex.getResult(),
-                                    layoutedResultIndex);
-    }
+    rewriter.replaceAllUsesExcept(argCompareOp.getResult(0),
+                                  layoutedResultValue.getResult(),
+                                  layoutedResultValue);
+    rewriter.replaceAllUsesExcept(argCompareOp.getResult(1),
+                                  layoutedResultIndex.getResult(),
+                                  layoutedResultIndex);
   }
 
   return success();
@@ -279,14 +278,16 @@ struct LLVMGPUVectorDistributePass final
       return signalPassFailure();
     }
 
-    // Note: arg_compare layout anchors are handled by layout analysis
-    // The DistributeArgCompare pattern will handle distribution
+    // Set layout anchors for arg_compare operations
+    if (failed(setArgCompareAnchors(funcOp, rewriter, *subgroupSize))) {
+      return signalPassFailure();
+    }
 
     // Dump IR after setting anchors - DISABLED FOR NOW
     // fprintf(stderr, "\n========== IR After Setting Anchors ==========\n");
     // fflush(stderr);
-    // funcOp->print(llvm::errs(), mlir::OpPrintingFlags().printGenericOpForm(false));
-    // llvm::errs() << "\n";
+    // funcOp->print(llvm::errs(),
+    // mlir::OpPrintingFlags().printGenericOpForm(false)); llvm::errs() << "\n";
     // llvm::errs().flush();
     // fprintf(stderr, "========== End IR Dump ==========\n\n");
     // fflush(stderr);
@@ -294,7 +295,8 @@ struct LLVMGPUVectorDistributePass final
     ContractionVectorLayoutOptions options(funcOp, linearThreadIdVal,
                                            subgroupSize.value(), workgroupSize);
 
-    LogicalResult result = distributeVectorOps(funcOp, options.getPatterns(), options);
+    LogicalResult result =
+        distributeVectorOps(funcOp, options.getPatterns(), options);
     if (failed(result)) {
       funcOp->emitOpError() << "failed to distribute";
       return signalPassFailure();

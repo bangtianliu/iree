@@ -45,7 +45,8 @@ setOpSignature(Operation *op,
   SmallVector<Attribute> results;
 
   // Count total operands including non-vectors and 0-D vectors for UnitAttr
-  SmallVector<Attribute> allOperands(op->getNumOperands(), UnitAttr::get(op->getContext()));
+  SmallVector<Attribute> allOperands(op->getNumOperands(),
+                                     UnitAttr::get(op->getContext()));
 
   // Only fill in layouts for non-zero rank vectors
   for (auto [idx, operand] : llvm::enumerate(op->getOperands())) {
@@ -69,7 +70,8 @@ setOpSignature(Operation *op,
   operands = std::move(allOperands);
 
   // Count total results including non-vectors and 0-D vectors for UnitAttr
-  SmallVector<Attribute> allResults(op->getNumResults(), UnitAttr::get(op->getContext()));
+  SmallVector<Attribute> allResults(op->getNumResults(),
+                                    UnitAttr::get(op->getContext()));
 
   // Only fill in layouts for non-zero rank vectors
   for (auto [idx, result] : llvm::enumerate(op->getResults())) {
@@ -127,7 +129,8 @@ static DistributionSignature getOpSignature(Operation *op) {
     if (isa<UnitAttr>(layout)) {
       if (auto vectorValue = dyn_cast<VectorValue>(value)) {
         assert(!isNonZeroRank(vectorValue) &&
-               "Malformed signature attribute: unit attribute for non-zero rank vector.");
+               "Malformed signature attribute: unit attribute for non-zero "
+               "rank vector.");
       }
       return; // Don't add to signature map
     }
@@ -183,7 +186,8 @@ SmallVector<Value> DistributionPattern::getOpDistributedReplacements(
     auto replacementVecType = dyn_cast<VectorType>(replacement.getType());
     auto originalVecType = dyn_cast<VectorType>(opResult.getType());
 
-    // Only create to_simd if BOTH the replacement AND original are non-0D vectors
+    // Only create to_simd if BOTH the replacement AND original are non-0D
+    // vectors
     if (replacementVecType && replacementVecType.getRank() != 0 &&
         originalVecType && originalVecType.getRank() != 0) {
       auto oldResult = cast<VectorValue>(opResult);
@@ -195,11 +199,27 @@ SmallVector<Value> DistributionPattern::getOpDistributedReplacements(
       replacement = toSIMD;
     } else if (replacementVecType && originalVecType &&
                replacementVecType != originalVecType) {
-      // If types don't match (e.g., vector<1x1xi32> -> vector<i32>),
-      // use shape_cast to convert
+      // If types don't match, we need to convert.
       rewriter.setInsertionPointAfterValue(opResult);
-      replacement = vector::ShapeCastOp::create(
-          rewriter, opResult.getLoc(), originalVecType, replacement);
+
+      // Special case: converting any vector with 1 element to 0D vector
+      // (e.g., vector<1xi64> -> vector<i64>, vector<1x1x1xbf16> ->
+      // vector<bf16>) LLVM doesn't support shape_cast to 0D vectors, so we use
+      // vector.extract to get the scalar, then vector.broadcast to 0D.
+      if (originalVecType.getRank() == 0 &&
+          replacementVecType.getNumElements() == 1) {
+        // Extract the scalar element using all-zero indices
+        SmallVector<int64_t> indices(replacementVecType.getRank(), 0);
+        Value scalar = vector::ExtractOp::create(rewriter, opResult.getLoc(),
+                                                 replacement, indices);
+        // Broadcast scalar to 0D vector
+        replacement = vector::BroadcastOp::create(rewriter, opResult.getLoc(),
+                                                  originalVecType, scalar);
+      } else {
+        // General case - use shape_cast
+        replacement = vector::ShapeCastOp::create(rewriter, opResult.getLoc(),
+                                                  originalVecType, replacement);
+      }
     }
     replacements.push_back(replacement);
   }

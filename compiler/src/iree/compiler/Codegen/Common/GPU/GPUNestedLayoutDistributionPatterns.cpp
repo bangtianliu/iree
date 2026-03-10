@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include <cstdint>
+
 #include "iree/compiler/Codegen/Common/GPU/GPUPatterns.h"
 #include "iree/compiler/Codegen/Common/GPU/GPUVectorDistribution.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
@@ -18,11 +19,11 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/Utils/GPUUtils.h"
-#include "mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
@@ -311,8 +312,8 @@ struct DistributeTransferRead final
     // Skip 0-D vectors (scalars) - they don't need distribution
     auto resultVector = readOp.getResult();
     if (!isNonZeroRank(resultVector)) {
-      return rewriter.notifyMatchFailure(readOp,
-                                         "0-D vector (scalar) doesn't need distribution");
+      return rewriter.notifyMatchFailure(
+          readOp, "0-D vector (scalar) doesn't need distribution");
     }
 
     NestedLayoutAttr vectorLayout =
@@ -498,13 +499,13 @@ struct DistributeTransferWrite final
     auto valueToStore = writeOp.getValueToStore();
     if (auto vecValue = dyn_cast<VectorValue>(valueToStore)) {
       if (!isNonZeroRank(vecValue)) {
-        return rewriter.notifyMatchFailure(writeOp,
-                                           "0-D vector (scalar) doesn't need distribution");
+        return rewriter.notifyMatchFailure(
+            writeOp, "0-D vector (scalar) doesn't need distribution");
       }
     }
 
-    NestedLayoutAttr vectorLayout =
-        dyn_cast_if_present<NestedLayoutAttr>(signature[cast<VectorValue>(valueToStore)]);
+    NestedLayoutAttr vectorLayout = dyn_cast_if_present<NestedLayoutAttr>(
+        signature[cast<VectorValue>(valueToStore)]);
     if (!vectorLayout) {
       return rewriter.notifyMatchFailure(writeOp,
                                          "non-nested transfer_write layout");
@@ -628,7 +629,8 @@ struct DistributeTransferGather final
     SmallVector<VectorValue> disIndexVecs;
     for (Value indexVec : gatherOp.getIndexVecs()) {
       auto vec = cast<VectorValue>(indexVec);
-      NestedLayoutAttr layout = dyn_cast_if_present<NestedLayoutAttr>(signature[vec]);
+      NestedLayoutAttr layout =
+          dyn_cast_if_present<NestedLayoutAttr>(signature[vec]);
       if (!layout) {
         return rewriter.notifyMatchFailure(gatherOp,
                                            "non-nested index vec layout");
@@ -901,7 +903,8 @@ struct DistributeBroadcast final : OpDistributionPattern<vector::BroadcastOp> {
                                 DistributionSignature &signature,
                                 PatternRewriter &rewriter) const override {
     VectorValue dstVector = broadcastOp.getVector();
-    auto vectorLayout = dyn_cast_if_present<NestedLayoutAttr>(signature[dstVector]);
+    auto vectorLayout =
+        dyn_cast_if_present<NestedLayoutAttr>(signature[dstVector]);
     if (!vectorLayout) {
       return rewriter.notifyMatchFailure(broadcastOp,
                                          "non-nested result vector layout");
@@ -935,7 +938,8 @@ struct DistributeBroadcast final : OpDistributionPattern<vector::BroadcastOp> {
 
     Value distSource = broadcastOp.getSource();
     if (srcVector && isNonZeroRank(srcVector)) {
-      auto sourceLayout = dyn_cast_if_present<NestedLayoutAttr>(signature[srcVector]);
+      auto sourceLayout =
+          dyn_cast_if_present<NestedLayoutAttr>(signature[srcVector]);
       if (!sourceLayout) {
         return rewriter.notifyMatchFailure(broadcastOp,
                                            "non-nested source vector layout");
@@ -1434,12 +1438,14 @@ struct DistributeContract final
           contractOp, "iree.gpu.mma intrinsic attribute exists");
     }
 
-    auto lhsLayout = dyn_cast_if_present<NestedLayoutAttr>(signature[contractOp.getLhs()]);
+    auto lhsLayout =
+        dyn_cast_if_present<NestedLayoutAttr>(signature[contractOp.getLhs()]);
     if (!lhsLayout) {
       return rewriter.notifyMatchFailure(
           contractOp, "missing nested layout for contraction lhs");
     }
-    auto rhsLayout = dyn_cast_if_present<NestedLayoutAttr>(signature[contractOp.getRhs()]);
+    auto rhsLayout =
+        dyn_cast_if_present<NestedLayoutAttr>(signature[contractOp.getRhs()]);
     if (!rhsLayout) {
       return rewriter.notifyMatchFailure(
           contractOp, "missing nested layout for contraction rhs");
@@ -1655,7 +1661,8 @@ struct DistributeTranspose final : OpDistributionPattern<vector::TransposeOp> {
                                 DistributionSignature &signature,
                                 PatternRewriter &rewriter) const override {
     VectorValue value = transposeOp.getVector();
-    VectorLayoutInterface layout = dyn_cast_if_present<NestedLayoutAttr>(signature[value]);
+    VectorLayoutInterface layout =
+        dyn_cast_if_present<NestedLayoutAttr>(signature[value]);
     if (!layout) {
       return rewriter.notifyMatchFailure(transposeOp,
                                          "layout must be NestedLayoutAttr");
@@ -2342,17 +2349,18 @@ struct DistributeInnerTiled final
 };
 
 /// Lowering for arg_compare operations.
-/// This pattern distributes iree_vector_ext.arg_compare operations across threads.
-/// Unlike standard reductions, arg_compare tracks both a value and an index,
-/// requiring simultaneous reduction of two vectors with comparator-based selection.
+/// This pattern distributes iree_vector_ext.arg_compare operations across
+/// threads. Unlike standard reductions, arg_compare tracks both a value and an
+/// index, requiring simultaneous reduction of two vectors with comparator-based
+/// selection.
 struct DistributeArgCompare final
     : OpDistributionPattern<IREE::VectorExt::ArgCompareOp> {
   using OpDistributionPattern::OpDistributionPattern;
 
   DistributeArgCompare(MLIRContext *context, int64_t subgroupSize,
                        int64_t maxBitsPerShuffle, int64_t benefit = 1)
-      : OpDistributionPattern(context, benefit),
-        subgroupSize(subgroupSize), maxBitsPerShuffle(maxBitsPerShuffle) {}
+      : OpDistributionPattern(context, benefit), subgroupSize(subgroupSize),
+        maxBitsPerShuffle(maxBitsPerShuffle) {}
 
   LogicalResult matchAndRewrite(IREE::VectorExt::ArgCompareOp argCompareOp,
                                 DistributionSignature &signature,
@@ -2362,39 +2370,104 @@ struct DistributeArgCompare final
     // Extract input value and its layout
     VectorValue inputVal = argCompareOp.getInputValue();
 
-    auto inputLayout = dyn_cast_if_present<NestedLayoutAttr>(signature[inputVal]);
+    auto inputLayout =
+        dyn_cast_if_present<NestedLayoutAttr>(signature[inputVal]);
     if (!inputLayout) {
-      return rewriter.notifyMatchFailure(argCompareOp,
-                                         "expected nested layout attr for input");
+      return rewriter.notifyMatchFailure(
+          argCompareOp, "expected nested layout attr for input");
+    }
+
+    // Detect and handle unit dimensions in the input shape.
+    // Unit dimensions (size=1) cause LLVM lowering issues because
+    // vector<Nx1xf16> gets converted to array<N x vector<1xf16>>
+    // which fails to convert back. We drop unit dims at the start
+    // and work with rank-reduced shapes throughout distribution.
+    ArrayRef<int64_t> inputShape = inputVal.getType().getShape();
+    int64_t originalRank = inputShape.size();
+    SmallVector<bool> unitDims(originalRank, false);
+    SmallVector<int64_t> rankReducedShape;
+    for (auto [idx, size] : llvm::enumerate(inputShape)) {
+      if (size == 1) {
+        unitDims[idx] = true;
+      } else {
+        rankReducedShape.push_back(size);
+      }
+    }
+
+    // Check if we have any unit dims to drop
+    bool hasUnitDims = llvm::any_of(unitDims, [](bool b) { return b; });
+
+    // If we have unit dims, we need to project layouts and shape_cast values
+    VectorValue effectiveInputVal = inputVal;
+    NestedLayoutAttr effectiveInputLayout = inputLayout;
+    int64_t effectiveReductionDim = argCompareOp.getDimension();
+
+    if (hasUnitDims && rankReducedShape.size() > 0) {
+      // Project the layout to drop unit dimensions
+      effectiveInputLayout =
+          cast<NestedLayoutAttr>(inputLayout.project(unitDims));
+
+      // Compute the effective reduction dimension after dropping unit dims
+      for (int64_t i = 0; i < argCompareOp.getDimension(); ++i) {
+        if (unitDims[i]) {
+          effectiveReductionDim--;
+        }
+      }
+
+      // Shape cast input to drop unit dims
+      auto rankReducedInputType = VectorType::get(
+          rankReducedShape, inputVal.getType().getElementType());
+      effectiveInputVal = vector::ShapeCastOp::create(
+          rewriter, loc, rankReducedInputType, inputVal);
+
+      // Update signature for the shape-casted value
+      setSignatureForRedistribution(rewriter, effectiveInputVal.getDefiningOp(),
+                                    {inputLayout}, {effectiveInputLayout});
     }
 
     // Check element bitwidth
-    Type elemTy = inputVal.getType().getElementType();
+    Type elemTy = effectiveInputVal.getType().getElementType();
     unsigned elemBitwidth = elemTy.getIntOrFloatBitWidth();
     if (elemBitwidth > maxBitsPerShuffle) {
       return rewriter.notifyMatchFailure(
           argCompareOp,
-          llvm::formatv("element bitwidth {0} greater than maxBitsPerShuffle {1}",
-                        elemBitwidth, maxBitsPerShuffle));
+          llvm::formatv(
+              "element bitwidth {0} greater than maxBitsPerShuffle {1}",
+              elemBitwidth, maxBitsPerShuffle));
     }
 
-    // Get distributed inputs
-    VectorValue disInputVal = getDistributed(rewriter, inputVal, signature[inputVal]);
+    // Get distributed inputs (using effective values with unit dims dropped)
+    VectorValue disInputVal =
+        getDistributed(rewriter, effectiveInputVal, effectiveInputLayout);
 
     // Handle optional input_index (explicit-index mode)
     Value disInputIdx = nullptr;
     if (Value inputIdx = argCompareOp.getInputIndex()) {
       VectorValue inputIdxVec = cast<VectorValue>(inputIdx);
-      disInputIdx = getDistributed(rewriter, inputIdxVec, signature[inputIdxVec]);
+      VectorValue effectiveInputIdxVec = inputIdxVec;
+      if (hasUnitDims && rankReducedShape.size() > 0) {
+        // Shape cast index to drop unit dims
+        auto rankReducedIdxType = VectorType::get(
+            rankReducedShape, inputIdxVec.getType().getElementType());
+        effectiveInputIdxVec = vector::ShapeCastOp::create(
+            rewriter, loc, rankReducedIdxType, inputIdxVec);
+        setSignatureForRedistribution(
+            rewriter, effectiveInputIdxVec.getDefiningOp(),
+            {signature[inputIdxVec]}, {effectiveInputLayout});
+      }
+      disInputIdx =
+          getDistributed(rewriter, effectiveInputIdxVec, effectiveInputLayout);
     }
 
     // Get init vectors
-    // Note: init values can be 0-D vectors (scalars) which don't need distribution
+    // Note: init values can be 0-D vectors (scalars) which don't need
+    // distribution
     VectorValue initVal = argCompareOp.getInitValue();
     VectorValue initIdx = argCompareOp.getInitIndex();
 
     // Check if init values are non-zero rank (need distribution)
-    // 0-D vectors are scalars and are "always distributed to all threads already"
+    // 0-D vectors are scalars and are "always distributed to all threads
+    // already"
     VectorValue disInitVal;
     VectorValue disInitIdx;
     if (isNonZeroRank(initVal)) {
@@ -2413,17 +2486,19 @@ struct DistributeArgCompare final
       disInitIdx = initIdx;
     }
 
-    // Get the reduction dimension
-    int64_t reductionDim = argCompareOp.getDimension();
+    // Use the effective reduction dimension (adjusted for dropped unit dims)
+    int64_t reductionDim = effectiveReductionDim;
 
     // Create reduction mask (true for the reduction dimension)
-    int64_t rank = inputVal.getType().getRank();
+    // Use the effective rank (after dropping unit dims)
+    int64_t rank = effectiveInputVal.getType().getRank();
     SmallVector<bool> reducedDims(rank, false);
     reducedDims[reductionDim] = true;
 
     // Step 1: Local reduction across batch/outer/element dims
     // For arg_compare, we need to apply the comparator to do local reduction
-    // The distributed reduction mask is the same mask appended thrice (batch, outer, element)
+    // The distributed reduction mask is the same mask appended thrice (batch,
+    // outer, element)
     SmallVector<bool> distributedReductionMask;
     distributedReductionMask.reserve(3 * rank);
     for (int i = 0; i < 3; ++i) {
@@ -2432,7 +2507,8 @@ struct DistributeArgCompare final
 
     // For the local reduction, init values must have rank = input_rank - 1.
     // After distribution, both input and init have different ranks, so we need
-    // to broadcast init to match: distributed_init_rank = distributed_input_rank - 1.
+    // to broadcast init to match: distributed_init_rank =
+    // distributed_input_rank - 1.
     VectorValue localInitVal = disInitVal;
     VectorValue localInitIdx = disInitIdx;
 
@@ -2443,15 +2519,17 @@ struct DistributeArgCompare final
 
     if (actualInitRank != expectedInitRank && expectedInitRank > 0) {
       // Create shape for init: remove the reduction dimension from input shape
-      SmallVector<int64_t> initShape(distInputShape.begin(), distInputShape.end());
+      SmallVector<int64_t> initShape(distInputShape.begin(),
+                                     distInputShape.end());
       // The reduction dimension in distributed space may be different. For a
-      // 2D layout distributed to 6D (batch[2], outer[2], thread[2]), the original
-      // reduction dim 1 becomes dimension 1, 3, 5 (batch[1], outer[1], thread[1]).
-      // We remove the first occurrence (batch dimension).
+      // 2D layout distributed to 6D (batch[2], outer[2], thread[2]), the
+      // original reduction dim 1 becomes dimension 1, 3, 5 (batch[1], outer[1],
+      // thread[1]). We remove the first occurrence (batch dimension).
       initShape.erase(initShape.begin() + reductionDim);
 
       // Broadcast/shape_cast to the expected shape
-      auto initValVecType = VectorType::get(initShape, disInitVal.getType().getElementType());
+      auto initValVecType =
+          VectorType::get(initShape, disInitVal.getType().getElementType());
       if (actualInitRank == 0) {
         // 0-D scalar: broadcast to target shape
         auto broadcastVal = vector::BroadcastOp::create(
@@ -2459,25 +2537,28 @@ struct DistributeArgCompare final
         localInitVal = broadcastVal.getResult();
       } else {
         // Non-0D but wrong rank: use shape_cast
-        // This handles the case where distributed init has fewer dims than expected
-        localInitVal = vector::ShapeCastOp::create(
-            rewriter, loc, initValVecType, disInitVal);
+        // This handles the case where distributed init has fewer dims than
+        // expected
+        localInitVal = vector::ShapeCastOp::create(rewriter, loc,
+                                                   initValVecType, disInitVal);
       }
 
-      auto initIdxVecType = VectorType::get(initShape, disInitIdx.getType().getElementType());
+      auto initIdxVecType =
+          VectorType::get(initShape, disInitIdx.getType().getElementType());
       if (actualInitRank == 0) {
         auto broadcastIdx = vector::BroadcastOp::create(
             rewriter, loc, initIdxVecType, disInitIdx);
         localInitIdx = broadcastIdx.getResult();
       } else {
-        localInitIdx = vector::ShapeCastOp::create(
-            rewriter, loc, initIdxVecType, disInitIdx);
+        localInitIdx = vector::ShapeCastOp::create(rewriter, loc,
+                                                   initIdxVecType, disInitIdx);
       }
     }
 
-    // For element_tile=1, local reduction is trivial - each thread has one element
-    // For element_tile>1, we need to reduce the local elements within each thread
-    int64_t elementTile = inputLayout.getElementTile()[reductionDim];
+    // For element_tile=1, local reduction is trivial - each thread has one
+    // element For element_tile>1, we need to reduce the local elements within
+    // each thread
+    int64_t elementTile = effectiveInputLayout.getElementTile()[reductionDim];
 
     VectorValue locallyReducedVal;
     VectorValue locallyReducedIdx;
@@ -2492,7 +2573,8 @@ struct DistributeArgCompare final
       // Use doLocalArgCompareReduction to reduce the element dimension
       auto localReduced = doLocalArgCompareReduction(
           rewriter, loc, disInputVal, cast<VectorValue>(disInputIdx),
-          argCompareOp.getRegion(), elementTile, reductionDim, inputLayout);
+          argCompareOp.getRegion(), elementTile, reductionDim,
+          effectiveInputLayout);
 
       if (failed(localReduced)) {
         return rewriter.notifyMatchFailure(
@@ -2506,9 +2588,9 @@ struct DistributeArgCompare final
 
     // Step 2: Thread-level reduction
     bool hasThreadReductions =
-        inputLayout.getThreadTile()[reductionDim] > 1;
+        effectiveInputLayout.getThreadTile()[reductionDim] > 1;
     bool hasSubgroupReductions =
-        inputLayout.getSubgroupTile()[reductionDim] > 1;
+        effectiveInputLayout.getSubgroupTile()[reductionDim] > 1;
 
     VectorValue threadReducedVal = locallyReducedVal;
     VectorValue threadReducedIdx = locallyReducedIdx;
@@ -2520,8 +2602,10 @@ struct DistributeArgCompare final
       int64_t numElements = valShape.getNumElements();
 
       SmallVector<int64_t> flatShape(1, numElements);
-      VectorType flatValType = VectorType::get(flatShape, valShape.getElementType());
-      VectorType flatIdxType = VectorType::get(flatShape, idxShape.getElementType());
+      VectorType flatValType =
+          VectorType::get(flatShape, valShape.getElementType());
+      VectorType flatIdxType =
+          VectorType::get(flatShape, idxShape.getElementType());
 
       VectorValue flatVal = vector::ShapeCastOp::create(
           rewriter, loc, flatValType, locallyReducedVal);
@@ -2530,7 +2614,7 @@ struct DistributeArgCompare final
 
       // Do inter-thread reduction using butterfly shuffles
       auto threadReduced = doArgCompareThreadReduction(
-          rewriter, inputLayout, flatVal, flatIdx,
+          rewriter, effectiveInputLayout, flatVal, flatIdx,
           argCompareOp.getRegion(), reducedDims);
 
       if (failed(threadReduced)) {
@@ -2538,35 +2622,87 @@ struct DistributeArgCompare final
       }
 
       // Reshape back to original shape
-      threadReducedVal = vector::ShapeCastOp::create(
-          rewriter, loc, valShape, threadReduced->first);
-      threadReducedIdx = vector::ShapeCastOp::create(
-          rewriter, loc, idxShape, threadReduced->second);
+      // Special case: if original shape is 0D (scalar vector) and flat shape is
+      // 1D with size 1, we need to use extract+broadcast instead of shape_cast
+      // because LLVM doesn't support shape_cast from 1D to 0D.
+      if (valShape.getRank() == 0 && flatValType.getRank() == 1 &&
+          flatValType.getNumElements() == 1) {
+        // Extract scalar and broadcast to 0D vector
+        Value scalarVal = vector::ExtractOp::create(
+            rewriter, loc, threadReduced->first, ArrayRef<int64_t>{0});
+        threadReducedVal =
+            vector::BroadcastOp::create(rewriter, loc, valShape, scalarVal);
+      } else {
+        threadReducedVal = vector::ShapeCastOp::create(rewriter, loc, valShape,
+                                                       threadReduced->first);
+      }
+
+      if (idxShape.getRank() == 0 && flatIdxType.getRank() == 1 &&
+          flatIdxType.getNumElements() == 1) {
+        // Extract scalar and broadcast to 0D vector
+        Value scalarIdx = vector::ExtractOp::create(
+            rewriter, loc, threadReduced->second, ArrayRef<int64_t>{0});
+        threadReducedIdx =
+            vector::BroadcastOp::create(rewriter, loc, idxShape, scalarIdx);
+      } else {
+        threadReducedIdx = vector::ShapeCastOp::create(rewriter, loc, idxShape,
+                                                       threadReduced->second);
+      }
     }
 
     // Step 3: Subgroup-level reduction
     if (hasSubgroupReductions) {
-      // Get result layouts
-      // Note: Results are 0-D vectors (scalars) so they won't have layouts in signature
-      // Results are always 0-D vectors for reductions, create empty layout
-      // 0-D vectors have rank 0, so all tile sizes are empty
-      auto emptyLayout = NestedLayoutAttr::get(
-          rewriter.getContext(),
-          /*subgroupTile=*/{}, /*batchTile=*/{}, /*outerTile=*/{},
-          /*threadTile=*/{}, /*elementTile=*/{},
-          /*subgroupStrides=*/{}, /*threadStrides=*/{});
-      VectorLayoutInterface resValLayout = emptyLayout;
-      VectorLayoutInterface resIdxLayout = emptyLayout;
+      // Get result layouts from the signature.
+      // For 0-D vectors (scalars), create empty layout.
+      // For non-0D vectors (e.g., batched reduction), get layout from
+      // signature.
+      VectorValue resVal = argCompareOp.getResultValue();
+      VectorValue resIdx = argCompareOp.getResultIndex();
+
+      VectorLayoutInterface resValLayout;
+      VectorLayoutInterface resIdxLayout;
+
+      if (resVal.getType().getRank() > 0) {
+        // Non-0D result - get layout from signature
+        resValLayout = signature[resVal];
+      }
+      if (!resValLayout) {
+        // 0-D result or no layout in signature - create empty layout
+        resValLayout = NestedLayoutAttr::get(
+            rewriter.getContext(),
+            /*subgroupTile=*/{}, /*batchTile=*/{}, /*outerTile=*/{},
+            /*threadTile=*/{}, /*elementTile=*/{},
+            /*subgroupStrides=*/{}, /*threadStrides=*/{});
+      }
+
+      if (resIdx.getType().getRank() > 0) {
+        // Non-0D result - get layout from signature
+        resIdxLayout = signature[resIdx];
+      }
+      if (!resIdxLayout) {
+        // 0-D result or no layout in signature - create empty layout
+        resIdxLayout = NestedLayoutAttr::get(
+            rewriter.getContext(),
+            /*subgroupTile=*/{}, /*batchTile=*/{}, /*outerTile=*/{},
+            /*threadTile=*/{}, /*elementTile=*/{},
+            /*subgroupStrides=*/{}, /*threadStrides=*/{});
+      }
 
       // Perform cross-subgroup reduction via shared memory
       auto subgroupReduced = doArgCompareSubgroupReduction(
-          rewriter, loc, inputVal, argCompareOp.getInitIndex(),
-          inputLayout, reductionDim,
-          threadReducedVal, threadReducedIdx,
-          argCompareOp.getRegion(), resValLayout, resIdxLayout);
+          rewriter, loc, effectiveInputVal, argCompareOp.getInitIndex(),
+          effectiveInputLayout, reductionDim, threadReducedVal,
+          threadReducedIdx, argCompareOp.getRegion(), resValLayout,
+          resIdxLayout);
 
-      SmallVector<Value> results = {subgroupReduced.first, subgroupReduced.second};
-      replaceOpWithDistributedValues(rewriter, argCompareOp, results);
+      // Use rewriter.replaceOp() directly instead of
+      // replaceOpWithDistributedValues() because doArgCompareSubgroupReduction
+      // creates a new ArgCompareOp that will be redistributed. Using
+      // replaceOpWithDistributedValues would create a ToSIMDOp conversion that
+      // fails for 2D vectors with unit dimensions (e.g., vector<256x1xf16>).
+      SmallVector<Value> results = {subgroupReduced.first,
+                                    subgroupReduced.second};
+      rewriter.replaceOp(argCompareOp, results);
       return success();
     }
 
@@ -2578,18 +2714,18 @@ struct DistributeArgCompare final
 
   // Helper to perform local element-wise reduction for arg_compare.
   // This reduces multiple elements within each thread (when element_tile > 1).
-  // For example, if each thread holds 4 elements, this reduces them to 1 element.
+  // For example, if each thread holds 4 elements, this reduces them to 1
+  // element.
   //
-  // The distributed input has shape [batch, outer, element] where element is the
-  // element_tile dimension. We reduce along the element dimension.
+  // The distributed input has shape [batch, outer, element] where element is
+  // the element_tile dimension. We reduce along the element dimension.
   //
-  // Returns a pair of (val, idx) vectors with the element dimension reduced to 1.
-  FailureOr<std::pair<VectorValue, VectorValue>>
-  doLocalArgCompareReduction(RewriterBase &rewriter, Location loc,
-                             VectorValue inputVal, VectorValue inputIdx,
-                             Region &comparatorRegion,
-                             int64_t elementTile, int64_t reductionDim,
-                             NestedLayoutAttr layout) const {
+  // Returns a pair of (val, idx) vectors with the element dimension reduced
+  // to 1.
+  FailureOr<std::pair<VectorValue, VectorValue>> doLocalArgCompareReduction(
+      RewriterBase &rewriter, Location loc, VectorValue inputVal,
+      VectorValue inputIdx, Region &comparatorRegion, int64_t elementTile,
+      int64_t reductionDim, NestedLayoutAttr layout) const {
     VectorType valType = inputVal.getType();
     VectorType idxType = inputIdx.getType();
 
@@ -2597,10 +2733,12 @@ struct DistributeArgCompare final
     SmallVector<int64_t> shape(valType.getShape());
 
     // Find the element dimension in the distributed shape.
-    // The distributed shape is: [batch[0], ..., batch[n-1], outer[0], ..., outer[n-1],
+    // The distributed shape is: [batch[0], ..., batch[n-1], outer[0], ...,
+    // outer[n-1],
     //                           element[0], ..., element[n-1]]
     // where n is the original rank.
-    // For reductionDim, the element dimension is at position: 2*originalRank + reductionDim
+    // For reductionDim, the element dimension is at position: 2*originalRank +
+    // reductionDim
     int64_t originalRank = layout.getSubgroupTile().size();
     int64_t elementDimInDist = 2 * originalRank + reductionDim;
 
@@ -2622,18 +2760,20 @@ struct DistributeArgCompare final
 
     // Initialize accumulators with the first element
     SmallVector<int64_t> extractIndices(rank, 0);
-    Value accVal = vector::ExtractOp::create(
-        rewriter, loc, inputVal, extractIndices);
-    Value accIdx = vector::ExtractOp::create(
-        rewriter, loc, inputIdx, extractIndices);
+    Value accVal =
+        vector::ExtractOp::create(rewriter, loc, inputVal, extractIndices);
+    Value accIdx =
+        vector::ExtractOp::create(rewriter, loc, inputIdx, extractIndices);
 
     // Sequential reduction: compare each element with accumulator
     for (int64_t i = 1; i < numElements; ++i) {
       // Extract element i
       SmallVector<int64_t> indices(rank, 0);
       indices[elementDimInDist] = i;
-      Value elemVal = vector::ExtractOp::create(rewriter, loc, inputVal, indices);
-      Value elemIdx = vector::ExtractOp::create(rewriter, loc, inputIdx, indices);
+      Value elemVal =
+          vector::ExtractOp::create(rewriter, loc, inputVal, indices);
+      Value elemIdx =
+          vector::ExtractOp::create(rewriter, loc, inputIdx, indices);
 
       // Apply comparator: compare(accVal, elemVal)
       // Returns true if accVal should win (e.g., accVal > elemVal for argmax)
@@ -2676,34 +2816,39 @@ struct DistributeArgCompare final
       Value notAccWins = arith::XOrIOp::create(
           rewriter, loc, cmpResult,
           arith::ConstantOp::create(rewriter, loc, rewriter.getBoolAttr(true)));
-      Value tieAndSmaller = arith::AndIOp::create(
-          rewriter, loc, tieCondition, idxLess);
-      Value preferElem = arith::OrIOp::create(
-          rewriter, loc, notAccWins, tieAndSmaller);
+      Value tieAndSmaller =
+          arith::AndIOp::create(rewriter, loc, tieCondition, idxLess);
+      Value preferElem =
+          arith::OrIOp::create(rewriter, loc, notAccWins, tieAndSmaller);
 
       // Update accumulator
-      accVal = arith::SelectOp::create(rewriter, loc, preferElem, elemVal, accVal);
-      accIdx = arith::SelectOp::create(rewriter, loc, preferElem, elemIdx, accIdx);
+      accVal =
+          arith::SelectOp::create(rewriter, loc, preferElem, elemVal, accVal);
+      accIdx =
+          arith::SelectOp::create(rewriter, loc, preferElem, elemIdx, accIdx);
     }
 
     // Create output vectors with the reduced values
     // We need to insert the scalar into a vector of shape outputShape
-    // Since outputShape has the element dim = 1, we can use vector.from_elements
-    // or insert at index 0.
-    VectorType outputValType = VectorType::get(outputShape, valType.getElementType());
-    VectorType outputIdxType = VectorType::get(outputShape, idxType.getElementType());
+    // Since outputShape has the element dim = 1, we can use
+    // vector.from_elements or insert at index 0.
+    VectorType outputValType =
+        VectorType::get(outputShape, valType.getElementType());
+    VectorType outputIdxType =
+        VectorType::get(outputShape, idxType.getElementType());
 
-    // Create zero-initialized vectors and insert the reduced value at position 0
+    // Create zero-initialized vectors and insert the reduced value at position
+    // 0
     auto zeroVal = arith::ConstantOp::create(
         rewriter, loc, rewriter.getZeroAttr(outputValType));
     auto zeroIdx = arith::ConstantOp::create(
         rewriter, loc, rewriter.getZeroAttr(outputIdxType));
 
     SmallVector<int64_t> insertPos(rank, 0);
-    Value resultVal = vector::InsertOp::create(
-        rewriter, loc, accVal, zeroVal, insertPos);
-    Value resultIdx = vector::InsertOp::create(
-        rewriter, loc, accIdx, zeroIdx, insertPos);
+    Value resultVal =
+        vector::InsertOp::create(rewriter, loc, accVal, zeroVal, insertPos);
+    Value resultIdx =
+        vector::InsertOp::create(rewriter, loc, accIdx, zeroIdx, insertPos);
 
     return std::make_pair(cast<VectorValue>(resultVal),
                           cast<VectorValue>(resultIdx));
@@ -2838,11 +2983,11 @@ struct DistributeArgCompare final
           /*permArgument=*/rewriter.getUnitAttr(),
           /*row_mask=*/allRows, /*bank_mask=*/allBanks, /*bound_ctrl=*/true);
     case 8:
-      return amdgpu::DPPOp::create(
-          rewriter, loc, src.getType(), /*old=*/src, /*src=*/src,
-          amdgpu::DPPPerm::row_mirror,
-          /*permArgument=*/rewriter.getUnitAttr(),
-          /*row_mask=*/allRows, /*bank_mask=*/allBanks, /*bound_ctrl=*/true);
+      return amdgpu::DPPOp::create(rewriter, loc, src.getType(), /*old=*/src,
+                                   /*src=*/src, amdgpu::DPPPerm::row_mirror,
+                                   /*permArgument=*/rewriter.getUnitAttr(),
+                                   /*row_mask=*/allRows, /*bank_mask=*/allBanks,
+                                   /*bound_ctrl=*/true);
     // Note: XOR 16 and XOR 32 cannot be efficiently implemented with DPP
     // row_bcast operations for custom comparators because row_bcast is a
     // broadcast, not an exchange. The row_bcast approach only works for
@@ -2861,7 +3006,8 @@ struct DistributeArgCompare final
   }
 
   // Helper to perform thread-level reduction for arg_compare.
-  // Unlike standard reductions, this must maintain both value and index vectors.
+  // Unlike standard reductions, this must maintain both value and index
+  // vectors.
   //
   // This implementation uses gpu::SubgroupReduceOp for the value reduction,
   // which enables DPP optimizations on AMD GPUs. After getting the reduced
@@ -2935,16 +3081,17 @@ struct DistributeArgCompare final
 
             // Try to use DPP for the shuffle (much faster than ds_bpermute).
             // Returns nullptr for unsupported offsets.
-            Value shuffledVal = createDPPShuffleXOR(rewriter, loc, currentVal,
-                                                    shuffleOffset);
+            Value shuffledVal =
+                createDPPShuffleXOR(rewriter, loc, currentVal, shuffleOffset);
             if (!shuffledVal) {
               // Fall back to ShuffleOp for unsupported offsets.
               Value shuffleOffset32 = arith::ConstantOp::create(
-                  rewriter, loc, rewriter.getIntegerAttr(i32Type, shuffleOffset));
-              shuffledVal =
-                  gpu::ShuffleOp::create(rewriter, loc, currentVal, shuffleOffset32,
-                                         width32, gpu::ShuffleMode::XOR)
-                      .getShuffleResult();
+                  rewriter, loc,
+                  rewriter.getIntegerAttr(i32Type, shuffleOffset));
+              shuffledVal = gpu::ShuffleOp::create(rewriter, loc, currentVal,
+                                                   shuffleOffset32, width32,
+                                                   gpu::ShuffleMode::XOR)
+                                .getShuffleResult();
             }
 
             // Apply comparator to determine winner
@@ -2979,12 +3126,13 @@ struct DistributeArgCompare final
         // value?
         Value myValueIsWinner;
         if (isa<FloatType>(elemType)) {
-          myValueIsWinner = arith::CmpFOp::create(
-              rewriter, loc, arith::CmpFPredicate::OEQ, extractedVal,
-              currentVal);
+          myValueIsWinner =
+              arith::CmpFOp::create(rewriter, loc, arith::CmpFPredicate::OEQ,
+                                    extractedVal, currentVal);
         } else {
-          myValueIsWinner = arith::CmpIOp::create(
-              rewriter, loc, arith::CmpIPredicate::eq, extractedVal, currentVal);
+          myValueIsWinner =
+              arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq,
+                                    extractedVal, currentVal);
         }
 
         // Use ROCDL ballot to get bitmask of threads with winning value.
@@ -2997,8 +3145,8 @@ struct DistributeArgCompare final
         // Find the thread with the smallest index among winners.
         // This is the lowest set bit in the ballot mask.
         // cttz returns the number of trailing zeros = index of first set bit.
-        Value winningThreadIdI64 =
-            math::CountTrailingZerosOp::create(rewriter, loc, i64Type, winnerMask);
+        Value winningThreadIdI64 = math::CountTrailingZerosOp::create(
+            rewriter, loc, i64Type, winnerMask);
 
         // Truncate to i32 for the shuffle operation.
         Value winningThreadId =
@@ -3024,17 +3172,14 @@ struct DistributeArgCompare final
   }
 
   // Helper to perform subgroup-level reduction for arg_compare.
-  // This handles reductions distributed across multiple subgroups using shared memory.
-  std::pair<VectorValue, VectorValue>
-  doArgCompareSubgroupReduction(PatternRewriter &rewriter, Location loc,
-                                VectorValue srcVal, VectorValue srcIdx,
-                                NestedLayoutAttr srcLayout,
-                                int64_t reductionDim,
-                                VectorValue threadReducedVal,
-                                VectorValue threadReducedIdx,
-                                Region &comparatorRegion,
-                                VectorLayoutInterface resValLayout,
-                                VectorLayoutInterface resIdxLayout) const {
+  // This handles reductions distributed across multiple subgroups using shared
+  // memory.
+  std::pair<VectorValue, VectorValue> doArgCompareSubgroupReduction(
+      PatternRewriter &rewriter, Location loc, VectorValue srcVal,
+      VectorValue srcIdx, NestedLayoutAttr srcLayout, int64_t reductionDim,
+      VectorValue threadReducedVal, VectorValue threadReducedIdx,
+      Region &comparatorRegion, VectorLayoutInterface resValLayout,
+      VectorLayoutInterface resIdxLayout) const {
     // The approach for subgroup reduction with arg_compare:
     // 1. Reshape thread-reduced results to maintain rank
     // 2. Write value and index to separate shared memory buffers
@@ -3052,10 +3197,10 @@ struct DistributeArgCompare final
       partialReducedShape[offset + reductionDim] = 1;
     }
 
-    VectorType partialReducedValType = VectorType::get(
-        partialReducedShape, srcVal.getType().getElementType());
-    VectorType partialReducedIdxType = VectorType::get(
-        partialReducedShape, srcIdx.getType().getElementType());
+    VectorType partialReducedValType =
+        VectorType::get(partialReducedShape, srcVal.getType().getElementType());
+    VectorType partialReducedIdxType =
+        VectorType::get(partialReducedShape, srcIdx.getType().getElementType());
 
     Value isoRankVal = vector::ShapeCastOp::create(
         rewriter, loc, partialReducedValType, threadReducedVal);
@@ -3063,10 +3208,37 @@ struct DistributeArgCompare final
         rewriter, loc, partialReducedIdxType, threadReducedIdx);
 
     // Step 2: Convert to SIMD form for writing to shared memory
-    SmallVector<int64_t> preDistrShape = srcLayout.getUndistributedPackedShape();
-    SmallVector<int64_t> partialReductionShape =
+    // Compute the partial reduction shape with subgroup tile on reduction dim
+    SmallVector<int64_t> preDistrShape =
+        srcLayout.getUndistributedPackedShape();
+    SmallVector<int64_t> fullPartialReductionShape =
         llvm::to_vector(srcVal.getType().getShape());
-    partialReductionShape[reductionDim] = preDistrShape[reductionDim];
+    fullPartialReductionShape[reductionDim] = preDistrShape[reductionDim];
+
+    // Drop unit dimensions to avoid LLVM lowering issues with shapes like
+    // vector<256x1xf16> which get converted to array<256 x vector<1xf16>>
+    // and fail to convert back.
+    SmallVector<int64_t> partialReductionShape;
+    SmallVector<bool> unitDims(fullPartialReductionShape.size(), false);
+    for (auto [idx, size] : llvm::enumerate(fullPartialReductionShape)) {
+      if (size == 1) {
+        unitDims[idx] = true;
+      } else {
+        partialReductionShape.push_back(size);
+      }
+    }
+
+    // If all dimensions are unit (scalar case), keep at least one dimension
+    if (partialReductionShape.empty()) {
+      partialReductionShape.push_back(1);
+      // Clear the last unitDim since we're keeping it
+      for (int64_t i = unitDims.size() - 1; i >= 0; --i) {
+        if (unitDims[i]) {
+          unitDims[i] = false;
+          break;
+        }
+      }
+    }
 
     auto unDistributedValType = VectorType::get(
         partialReductionShape, srcVal.getType().getElementType());
@@ -3078,27 +3250,42 @@ struct DistributeArgCompare final
     VectorValue idxToWrite = IREE::VectorExt::ToSIMDOp::create(
         rewriter, loc, unDistributedIdxType, isoRankIdx);
 
-    // Step 3: Allocate shared memory buffers
+    // Step 3: Allocate shared memory buffers (use rank-reduced shapes)
     auto workgroupSpace = Attribute(gpu::AddressSpaceAttr::get(
         rewriter.getContext(), gpu::AddressSpace::Workgroup));
-    MemRefType valMemType = MemRefType::get(
-        partialReductionShape, srcVal.getType().getElementType(),
-        AffineMap(), workgroupSpace);
-    MemRefType idxMemType = MemRefType::get(
-        partialReductionShape, srcIdx.getType().getElementType(),
-        AffineMap(), workgroupSpace);
+    MemRefType valMemType = MemRefType::get(partialReductionShape,
+                                            srcVal.getType().getElementType(),
+                                            AffineMap(), workgroupSpace);
+    MemRefType idxMemType = MemRefType::get(partialReductionShape,
+                                            srcIdx.getType().getElementType(),
+                                            AffineMap(), workgroupSpace);
 
-    Value valBuffer = getBufferForSubgroupReduction(rewriter, valMemType, valToWrite);
-    Value idxBuffer = getBufferForSubgroupReduction(rewriter, idxMemType, idxToWrite);
+    Value valBuffer =
+        getBufferForSubgroupReduction(rewriter, valMemType, valToWrite);
+    Value idxBuffer =
+        getBufferForSubgroupReduction(rewriter, idxMemType, idxToWrite);
 
     // Step 4: Write partial results to shared memory
+    // Project the layout to match the rank-reduced shape
+    NestedLayoutAttr projectedLayout =
+        cast<NestedLayoutAttr>(srcLayout.project(unitDims));
+
+    // Find the new reduction dimension index after dropping unit dims
+    int64_t projectedReductionDim = reductionDim;
+    for (int64_t i = 0; i < reductionDim; ++i) {
+      if (unitDims[i]) {
+        projectedReductionDim--;
+      }
+    }
+
     writeArgComparePartialToBuffer(rewriter, loc, valToWrite, idxToWrite,
-                                   valBuffer, idxBuffer, srcLayout, {reductionDim});
+                                   valBuffer, idxBuffer, projectedLayout,
+                                   {projectedReductionDim});
 
     // Step 5: Read back and complete reduction
     return doArgCompareSubgroupReductionFromBuffer(
-        rewriter, loc, valBuffer, idxBuffer, srcLayout,
-        resValLayout, resIdxLayout, {reductionDim}, comparatorRegion);
+        rewriter, loc, valBuffer, idxBuffer, projectedLayout, resValLayout,
+        resIdxLayout, {projectedReductionDim}, comparatorRegion);
   }
 
   Value getBufferForSubgroupReduction(RewriterBase &rewriter, MemRefType memTy,
@@ -3109,10 +3296,11 @@ struct DistributeArgCompare final
   }
 
   void writeArgComparePartialToBuffer(RewriterBase &rewriter, Location loc,
-                                     VectorValue valToWrite, VectorValue idxToWrite,
-                                     Value valBuffer, Value idxBuffer,
-                                     NestedLayoutAttr srcLayout,
-                                     ArrayRef<int64_t> reductionDims) const {
+                                      VectorValue valToWrite,
+                                      VectorValue idxToWrite, Value valBuffer,
+                                      Value idxBuffer,
+                                      NestedLayoutAttr srcLayout,
+                                      ArrayRef<int64_t> reductionDims) const {
     Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
     VectorType valType = valToWrite.getType();
     SmallVector<Value> indices(valType.getRank(), c0);
@@ -3127,13 +3315,16 @@ struct DistributeArgCompare final
         rewriter, loc, idxToWrite, idxBuffer, indices, inBounds);
 
     // Set layout for both writes
-    auto subgroupTile = llvm::to_vector_of<int64_t>(srcLayout.getSubgroupTile());
+    auto subgroupTile =
+        llvm::to_vector_of<int64_t>(srcLayout.getSubgroupTile());
     auto batchTile = llvm::to_vector_of<int64_t>(srcLayout.getBatchTile());
     auto outerTile = llvm::to_vector_of<int64_t>(srcLayout.getOuterTile());
     auto threadTile = llvm::to_vector_of<int64_t>(srcLayout.getThreadTile());
     auto elementTile = llvm::to_vector_of<int64_t>(srcLayout.getElementTile());
-    auto subgroupStrides = llvm::to_vector_of<int64_t>(srcLayout.getSubgroupStrides());
-    auto threadStrides = llvm::to_vector_of<int64_t>(srcLayout.getThreadStrides());
+    auto subgroupStrides =
+        llvm::to_vector_of<int64_t>(srcLayout.getSubgroupStrides());
+    auto threadStrides =
+        llvm::to_vector_of<int64_t>(srcLayout.getThreadStrides());
 
     for (int64_t rDim : reductionDims) {
       batchTile[rDim] = 1;
@@ -3144,20 +3335,18 @@ struct DistributeArgCompare final
     }
 
     auto interSubgroupLayout = IREE::VectorExt::NestedLayoutAttr::get(
-        rewriter.getContext(), subgroupTile, batchTile, outerTile,
-        threadTile, elementTile, subgroupStrides, threadStrides);
-    setSignatureForRedistribution(rewriter, writeVal, {interSubgroupLayout}, {});
-    setSignatureForRedistribution(rewriter, writeIdx, {interSubgroupLayout}, {});
+        rewriter.getContext(), subgroupTile, batchTile, outerTile, threadTile,
+        elementTile, subgroupStrides, threadStrides);
+    setSignatureForRedistribution(rewriter, writeVal, {interSubgroupLayout},
+                                  {});
+    setSignatureForRedistribution(rewriter, writeIdx, {interSubgroupLayout},
+                                  {});
   }
 
-  std::pair<VectorValue, VectorValue>
-  doArgCompareSubgroupReductionFromBuffer(
-      RewriterBase &rewriter, Location loc,
-      Value valBuffer, Value idxBuffer,
-      NestedLayoutAttr srcLayout,
-      VectorLayoutInterface resValLayout,
-      VectorLayoutInterface resIdxLayout,
-      ArrayRef<int64_t> reductionDims,
+  std::pair<VectorValue, VectorValue> doArgCompareSubgroupReductionFromBuffer(
+      RewriterBase &rewriter, Location loc, Value valBuffer, Value idxBuffer,
+      NestedLayoutAttr srcLayout, VectorLayoutInterface resValLayout,
+      VectorLayoutInterface resIdxLayout, ArrayRef<int64_t> reductionDims,
       Region &comparatorRegion) const {
 
     NestedLayoutAttr readLayout =
@@ -3173,25 +3362,26 @@ struct DistributeArgCompare final
     Value valPad;
     if (isa<FloatType>(valElemType)) {
       auto floatType = cast<FloatType>(valElemType);
-      APFloat negInf = APFloat::getInf(floatType.getFloatSemantics(), /*Negative=*/true);
-      valPad = arith::ConstantFloatOp::create(
-          rewriter, loc, floatType, negInf);
+      APFloat negInf =
+          APFloat::getInf(floatType.getFloatSemantics(), /*Negative=*/true);
+      valPad = arith::ConstantFloatOp::create(rewriter, loc, floatType, negInf);
     } else {
       // For integer types, use min value
       auto intType = cast<IntegerType>(valElemType);
       APInt minVal = APInt::getSignedMinValue(intType.getWidth());
-      valPad = arith::ConstantIntOp::create(
-          rewriter, loc, intType, minVal);
+      valPad = arith::ConstantIntOp::create(rewriter, loc, intType, minVal);
     }
 
     // For indices, use max value (will be rejected by comparator)
     auto idxIntType = cast<IntegerType>(idxElemType);
     APInt maxIdx = APInt::getSignedMaxValue(idxIntType.getWidth());
-    Value idxPad = arith::ConstantIntOp::create(
-        rewriter, loc, idxIntType, maxIdx);
+    Value idxPad =
+        arith::ConstantIntOp::create(rewriter, loc, idxIntType, maxIdx);
 
-    auto valReadTy = VectorType::get(readLayout.getUndistributedShape(), valElemType);
-    auto idxReadTy = VectorType::get(readLayout.getUndistributedShape(), idxElemType);
+    auto valReadTy =
+        VectorType::get(readLayout.getUndistributedShape(), valElemType);
+    auto idxReadTy =
+        VectorType::get(readLayout.getUndistributedShape(), idxElemType);
     auto zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
     auto inBounds = rewriter.getBoolArrayAttr(
         SmallVector<bool>(readLayout.getRank(), true));
@@ -3201,14 +3391,14 @@ struct DistributeArgCompare final
     // Read value vector from buffer
     auto readVal = vector::TransferReadOp::create(
         rewriter, loc, valReadTy, valBuffer, readIndices,
-        rewriter.getMultiDimIdentityMap(readLayout.getRank()),
-        valPad, /*mask=*/nullptr, inBounds);
+        rewriter.getMultiDimIdentityMap(readLayout.getRank()), valPad,
+        /*mask=*/nullptr, inBounds);
 
     // Read index vector from buffer
     auto readIdx = vector::TransferReadOp::create(
         rewriter, loc, idxReadTy, idxBuffer, readIndices,
-        rewriter.getMultiDimIdentityMap(readLayout.getRank()),
-        idxPad, /*mask=*/nullptr, inBounds);
+        rewriter.getMultiDimIdentityMap(readLayout.getRank()), idxPad,
+        /*mask=*/nullptr, inBounds);
 
     // TransferReadOp has no vector operands, only a vector result
     setSignatureForRedistribution(rewriter, readVal, {}, {readLayout});
@@ -3218,7 +3408,8 @@ struct DistributeArgCompare final
     // This will be distributed again and eventually lower to shuffles
 
     // Determine the result type after reducing along reductionDims[0]
-    // The result has the same shape as the input, but with the reduction dimension removed
+    // The result has the same shape as the input, but with the reduction
+    // dimension removed
     SmallVector<int64_t> resultShape = llvm::to_vector(valReadTy.getShape());
     resultShape.erase(resultShape.begin() + reductionDims[0]);
 
@@ -3230,25 +3421,28 @@ struct DistributeArgCompare final
     // For values, use -inf (neutral for argmax)
     Value initVal;
     if (auto floatType = dyn_cast<FloatType>(resultValElemType)) {
-      APFloat negInf = APFloat::getInf(floatType.getFloatSemantics(), /*Negative=*/true);
+      APFloat negInf =
+          APFloat::getInf(floatType.getFloatSemantics(), /*Negative=*/true);
       auto resultAttr = DenseElementsAttr::get(resultValType, negInf);
-      initVal = arith::ConstantOp::create(rewriter, loc, resultValType, resultAttr);
+      initVal =
+          arith::ConstantOp::create(rewriter, loc, resultValType, resultAttr);
     } else {
       auto intType = cast<IntegerType>(resultValElemType);
       APInt minVal = APInt::getSignedMinValue(intType.getWidth());
       auto resultAttr = DenseElementsAttr::get(resultValType, minVal);
-      initVal = arith::ConstantOp::create(rewriter, loc, resultValType, resultAttr);
+      initVal =
+          arith::ConstantOp::create(rewriter, loc, resultValType, resultAttr);
     }
 
     // For indices, use max int (will be rejected by comparator)
     auto resultIdxIntType = cast<IntegerType>(resultIdxElemType);
     APInt resultMaxIdx = APInt::getSignedMaxValue(resultIdxIntType.getWidth());
     auto resultIdxAttr = DenseElementsAttr::get(resultIdxType, resultMaxIdx);
-    Value initIdx = arith::ConstantOp::create(rewriter, loc, resultIdxType, resultIdxAttr);
+    Value initIdx =
+        arith::ConstantOp::create(rewriter, loc, resultIdxType, resultIdxAttr);
 
     auto secondReduction = IREE::VectorExt::ArgCompareOp::create(
-        rewriter, loc,
-        TypeRange{resultValType, resultIdxType},
+        rewriter, loc, TypeRange{resultValType, resultIdxType},
         /*input_value=*/readVal.getResult(),
         /*input_index=*/readIdx.getResult(),
         /*init_value=*/cast<VectorValue>(initVal),
@@ -3261,33 +3455,37 @@ struct DistributeArgCompare final
     rewriter.cloneRegionBefore(comparatorRegion, dstRegion, dstRegion.end());
 
     // Set signatures for operands and results
-    // Only non-0D vector operands need layouts. The init values are 0-D vectors (scalars)
-    // and should not have layouts. We only pass layouts for the input_value and input_index.
+    // Only non-0D vector operands need layouts. The init values are 0-D vectors
+    // (scalars) and should not have layouts. We only pass layouts for the
+    // input_value and input_index. For result layouts, we only add layouts for
+    // non-0D results (rank > 0).
     SmallVector<VectorLayoutInterface> resultLayouts;
-    if (resValLayout) {
+    if (resValLayout && resultValType.getRank() > 0) {
       resultLayouts.push_back(resValLayout);
     }
-    if (resIdxLayout) {
+    if (resIdxLayout && resultIdxType.getRank() > 0) {
       resultLayouts.push_back(resIdxLayout);
     }
     setSignatureForRedistribution(rewriter, secondReduction,
-                                  {readLayout, readLayout},
-                                  resultLayouts);
+                                  {readLayout, readLayout}, resultLayouts);
 
     return std::make_pair(secondReduction.getResultValue(),
-                         secondReduction.getResultIndex());
+                          secondReduction.getResultIndex());
   }
 
   NestedLayoutAttr
   getLayoutForReductionFromBuffer(NestedLayoutAttr srcLayout,
                                   ArrayRef<int64_t> reductionDims) const {
-    auto subgroupTile = llvm::to_vector_of<int64_t>(srcLayout.getSubgroupTile());
+    auto subgroupTile =
+        llvm::to_vector_of<int64_t>(srcLayout.getSubgroupTile());
     auto batchTile = llvm::to_vector_of<int64_t>(srcLayout.getBatchTile());
     auto outerTile = llvm::to_vector_of<int64_t>(srcLayout.getOuterTile());
     auto threadTile = llvm::to_vector_of<int64_t>(srcLayout.getThreadTile());
     auto elementTile = llvm::to_vector_of<int64_t>(srcLayout.getElementTile());
-    auto subgroupStrides = llvm::to_vector_of<int64_t>(srcLayout.getSubgroupStrides());
-    auto threadStrides = llvm::to_vector_of<int64_t>(srcLayout.getThreadStrides());
+    auto subgroupStrides =
+        llvm::to_vector_of<int64_t>(srcLayout.getSubgroupStrides());
+    auto threadStrides =
+        llvm::to_vector_of<int64_t>(srcLayout.getThreadStrides());
 
     int64_t threadsRequired = 1;
     for (int64_t rDim : reductionDims) {
@@ -3323,8 +3521,8 @@ struct DistributeArgCompare final
     }
 
     return IREE::VectorExt::NestedLayoutAttr::get(
-        srcLayout.getContext(), subgroupTile, batchTile, outerTile,
-        threadTile, elementTile, subgroupStrides, threadStrides);
+        srcLayout.getContext(), subgroupTile, batchTile, outerTile, threadTile,
+        elementTile, subgroupStrides, threadStrides);
   }
 
   int64_t subgroupSize;

@@ -2345,7 +2345,7 @@ static LogicalResult setRootConfig(IREE::GPU::TargetAttr target,
         LDBG() << "ArgCompare Config";
         if (clGPUEnableReductionVectorDistribution) {
           if (succeeded(IREE::GPU::setReductionConfig(target, entryPointFn,
-                                                       argCompareOp))) {
+                                                      argCompareOp))) {
             LDBG() << "Vector Distribution ArgCompare Reduction Config";
             return success();
           }

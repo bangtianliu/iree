@@ -924,9 +924,8 @@ transform_dialect::AMDGPUDistributeVectorsOp::applyToOne(
 
   // Set layout anchors for arg_compare operations before distribution
   SmallVector<IREE::VectorExt::ArgCompareOp> argCompareOps;
-  target->walk([&](IREE::VectorExt::ArgCompareOp op) {
-    argCompareOps.push_back(op);
-  });
+  target->walk(
+      [&](IREE::VectorExt::ArgCompareOp op) { argCompareOps.push_back(op); });
 
   for (auto argCompareOp : argCompareOps) {
     int64_t reductionDim = argCompareOp.getDimension();
@@ -939,7 +938,7 @@ transform_dialect::AMDGPUDistributeVectorsOp::applyToOne(
 
     // Create nested layout for the input vector
     SmallVector<int64_t> shape(inputValueType.getShape().begin(),
-                                inputValueType.getShape().end());
+                               inputValueType.getShape().end());
     int64_t rank = shape.size();
 
     SmallVector<int64_t> subgroupTile(rank, 1);
@@ -955,8 +954,8 @@ transform_dialect::AMDGPUDistributeVectorsOp::applyToOne(
     threadStrides[reductionDim] = 1;
 
     auto inputLayout = IREE::VectorExt::NestedLayoutAttr::get(
-        rewriter.getContext(), subgroupTile, batchTile, outerTile,
-        threadTile, elementTile, subgroupStrides, threadStrides);
+        rewriter.getContext(), subgroupTile, batchTile, outerTile, threadTile,
+        elementTile, subgroupStrides, threadStrides);
 
     rewriter.setInsertionPoint(argCompareOp);
     Location loc = argCompareOp.getLoc();
@@ -980,7 +979,7 @@ transform_dialect::AMDGPUDistributeVectorsOp::applyToOne(
     auto initValueType = initValue.getType();
     if (initValueType.getRank() > 0) {
       SmallVector<int64_t> initShape(initValueType.getShape().begin(),
-                                      initValueType.getShape().end());
+                                     initValueType.getShape().end());
       int64_t initRank = initShape.size();
 
       SmallVector<int64_t> initSubgroupTile(initRank, 1);
@@ -993,7 +992,8 @@ transform_dialect::AMDGPUDistributeVectorsOp::applyToOne(
 
       auto initLayout = IREE::VectorExt::NestedLayoutAttr::get(
           rewriter.getContext(), initSubgroupTile, initBatchTile, initOuterTile,
-          initThreadTile, initElementTile, initSubgroupStrides, initThreadStrides);
+          initThreadTile, initElementTile, initSubgroupStrides,
+          initThreadStrides);
 
       auto layoutedInitValue = IREE::VectorExt::ToLayoutOp::create(
           rewriter, loc, initValue, initLayout);
@@ -1003,14 +1003,16 @@ transform_dialect::AMDGPUDistributeVectorsOp::applyToOne(
       int initValueOperandIdx = argCompareOp.getInputIndex() ? 2 : 1;
       int initIndexOperandIdx = initValueOperandIdx + 1;
 
-      argCompareOp->setOperand(initValueOperandIdx, layoutedInitValue.getResult());
-      argCompareOp->setOperand(initIndexOperandIdx, layoutedInitIndex.getResult());
+      argCompareOp->setOperand(initValueOperandIdx,
+                               layoutedInitValue.getResult());
+      argCompareOp->setOperand(initIndexOperandIdx,
+                               layoutedInitIndex.getResult());
     }
 
     rewriter.setInsertionPointAfter(argCompareOp);
     if (initValueType.getRank() > 0) {
       SmallVector<int64_t> initShape(initValueType.getShape().begin(),
-                                      initValueType.getShape().end());
+                                     initValueType.getShape().end());
       int64_t initRank = initShape.size();
 
       SmallVector<int64_t> resultSubgroupTile(initRank, 1);
@@ -1022,8 +1024,9 @@ transform_dialect::AMDGPUDistributeVectorsOp::applyToOne(
       SmallVector<int64_t> resultThreadStrides(initRank, 0);
 
       auto resultLayout = IREE::VectorExt::NestedLayoutAttr::get(
-          rewriter.getContext(), resultSubgroupTile, resultBatchTile, resultOuterTile,
-          resultThreadTile, resultElementTile, resultSubgroupStrides, resultThreadStrides);
+          rewriter.getContext(), resultSubgroupTile, resultBatchTile,
+          resultOuterTile, resultThreadTile, resultElementTile,
+          resultSubgroupStrides, resultThreadStrides);
 
       auto layoutedResultValue = IREE::VectorExt::ToLayoutOp::create(
           rewriter, loc, argCompareOp.getResult(0), resultLayout);

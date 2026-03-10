@@ -566,7 +566,8 @@ struct DropScatterUnitIndexDepth final : public OpRewritePattern<ScatterOp> {
 FailureOr<Value> rankReduceOperand(RewriterBase &rewriter, Location loc,
                                    int64_t startDim, int64_t numDims,
                                    Value operand, ShapedType ty,
-                                   const linalg::ControlDropUnitDims &options) {
+                                   const linalg::ControlDropUnitDims &options,
+                                   bool allow0DTensor = false) {
   if (numDims == 0) {
     return failure();
   }
@@ -580,10 +581,12 @@ FailureOr<Value> rankReduceOperand(RewriterBase &rewriter, Location loc,
   }
   // Because gather/scatter like to define special behavior to allow eliding
   // the coordinate dimension, we have to make sure we don't generate a 0-D
-  // tensor.
-  auto slice = MutableArrayRef(unitDims).slice(startDim, numDims);
-  if (llvm::all_of(slice, [](bool x) { return x; })) {
-    slice.back() = false;
+  // tensor. However, ArgCompare needs 0-D tensors for full reductions.
+  if (!allow0DTensor) {
+    auto slice = MutableArrayRef(unitDims).slice(startDim, numDims);
+    if (llvm::all_of(slice, [](bool x) { return x; })) {
+      slice.back() = false;
+    }
   }
   SmallVector<int64_t> targetShape;
   targetShape.append(shape.begin(), shape.begin() + startDim);
@@ -831,6 +834,166 @@ struct DropScatterUnitDims final : public OpRewritePattern<ScatterOp> {
     rewriter.replaceOp(scatterOp,
                        rankExpandValue(rewriter, loc, scatterOp.getOriginal(),
                                        newScatter.getResult(0), options));
+    return success();
+  }
+
+private:
+  linalg::ControlDropUnitDims options;
+};
+
+struct DropArgCompareUnitDims final : public OpRewritePattern<ArgCompareOp> {
+  DropArgCompareUnitDims(MLIRContext *context,
+                         linalg::ControlDropUnitDims options,
+                         PatternBenefit benefit = 1)
+      : OpRewritePattern<ArgCompareOp>(context, benefit),
+        options(std::move(options)) {}
+
+  LogicalResult matchAndRewrite(ArgCompareOp argCompareOp,
+                                PatternRewriter &rewriter) const override {
+    Location loc = argCompareOp.getLoc();
+    if (!argCompareOp.hasPureTensorSemantics()) {
+      return rewriter.notifyMatchFailure(
+          argCompareOp,
+          "dropping unit dims not implemented for buffer semantics");
+    }
+
+    ShapedType inputType = argCompareOp.getInputType();
+    int64_t inputRank = inputType.getRank();
+    ArrayRef<int64_t> inputShape = inputType.getShape();
+
+    // Find which dimensions in the input are unit dimensions (size 1).
+    SmallVector<int64_t> unitDimIndices;
+    SmallVector<int64_t> newInputShape;
+    for (int64_t i = 0; i < inputRank; ++i) {
+      if (inputShape[i] == 1) {
+        unitDimIndices.push_back(i);
+      } else {
+        newInputShape.push_back(inputShape[i]);
+      }
+    }
+
+    // Also check for unit dims in the output operands.
+    // This handles cases where input has no unit dims but output does.
+    ShapedType outputValueType = argCompareOp.getOutputValueType();
+    ShapedType outputIndexType = argCompareOp.getOutputIndexType();
+    int64_t outputRank = outputValueType.getRank();
+    ArrayRef<int64_t> outputShape = outputValueType.getShape();
+
+    SmallVector<int64_t> outputUnitDimIndices;
+    for (int64_t i = 0; i < outputRank; ++i) {
+      if (outputShape[i] == 1) {
+        outputUnitDimIndices.push_back(i);
+      }
+    }
+
+    // No unit dims to drop in either input or output.
+    if (unitDimIndices.empty() && outputUnitDimIndices.empty()) {
+      return failure();
+    }
+
+    // Prevent collapsing input to 0-D tensors by keeping at least one
+    // dimension.
+    if (newInputShape.empty()) {
+      return failure();
+    }
+
+    int64_t originalDim = argCompareOp.getDimension();
+
+    // Calculate new dimension index accounting for dropped unit dims before it.
+    int64_t newDim = originalDim;
+    for (int64_t unitIdx : unitDimIndices) {
+      if (unitIdx < originalDim) {
+        newDim--;
+      }
+    }
+
+    // The reduction dimension itself is a unit dimension. This case is trivial
+    // and the operation should become a no-op (the result is the input).
+    // For now, we don't handle this case.
+    if (std::find(unitDimIndices.begin(), unitDimIndices.end(), originalDim) !=
+        unitDimIndices.end()) {
+      return failure();
+    }
+
+    // Collapse the input_value operand.
+    FailureOr<Value> newInputValue =
+        rankReduceOperand(rewriter, loc, /*startDim=*/0, /*numDims=*/inputRank,
+                          argCompareOp.getInputValue(), inputType, options);
+    if (failed(newInputValue)) {
+      return failure();
+    }
+
+    // Collapse the input_index operand if present (explicit-index mode).
+    Value newInputIndex;
+    if (Value inputIndex = argCompareOp.getInputIndex()) {
+      ShapedType inputIndexType = argCompareOp.getInputIndexType();
+      FailureOr<Value> reducedInputIndex = rankReduceOperand(
+          rewriter, loc, /*startDim=*/0, /*numDims=*/inputRank, inputIndex,
+          inputIndexType, options);
+      if (failed(reducedInputIndex)) {
+        return failure();
+      }
+      newInputIndex = reducedInputIndex.value();
+    }
+
+    // Output has one less dimension than input (the reduction dimension is
+    // removed). We need to track which parallel dimensions were unit dims.
+    SmallVector<int64_t> parallelUnitDimIndices;
+    for (int64_t unitIdx : unitDimIndices) {
+      if (unitIdx != originalDim) {
+        // Convert input dim index to output dim index.
+        int64_t outputDimIdx = unitIdx > originalDim ? unitIdx - 1 : unitIdx;
+        parallelUnitDimIndices.push_back(outputDimIdx);
+      }
+    }
+
+    // Collapse output_value and output_index.
+    // ArgCompare requires 0-D tensors for full reductions (when reducing a
+    // 1-D tensor over dimension 0, the output must be 0-D).
+    FailureOr<Value> newOutputValue = rankReduceOperand(
+        rewriter, loc, /*startDim=*/0, /*numDims=*/outputRank,
+        argCompareOp.getOutputValue(), outputValueType, options,
+        /*allow0DTensor=*/true);
+    if (failed(newOutputValue)) {
+      return failure();
+    }
+
+    FailureOr<Value> newOutputIndex = rankReduceOperand(
+        rewriter, loc, /*startDim=*/0, /*numDims=*/outputRank,
+        argCompareOp.getOutputIndex(), outputIndexType, options,
+        /*allow0DTensor=*/true);
+    if (failed(newOutputIndex)) {
+      return failure();
+    }
+
+    // Build result types from collapsed outputs.
+    SmallVector<Type, 2> resultTypes = {newOutputValue->getType(),
+                                        newOutputIndex->getType()};
+
+    // Create the new ArgCompareOp with collapsed operands.
+    ArgCompareOp newArgCompare = ArgCompareOp::create(
+        rewriter, loc, resultTypes, /*input_value=*/newInputValue.value(),
+        /*input_index=*/newInputIndex,
+        /*output_value=*/newOutputValue.value(),
+        /*output_index=*/newOutputIndex.value(),
+        /*index_base=*/argCompareOp.getIndexBase(),
+        /*dimension=*/newDim);
+
+    // Clone the comparator region.
+    rewriter.inlineRegionBefore(argCompareOp.getRegion(),
+                                newArgCompare.getRegion(),
+                                newArgCompare.getRegion().begin());
+
+    // Expand results back to original shape.
+    Value expandedValueResult =
+        rankExpandValue(rewriter, loc, argCompareOp.getOutputValue(),
+                        newArgCompare.getResult(0), options);
+    Value expandedIndexResult =
+        rankExpandValue(rewriter, loc, argCompareOp.getOutputIndex(),
+                        newArgCompare.getResult(1), options);
+
+    rewriter.replaceOp(argCompareOp,
+                       {expandedValueResult, expandedIndexResult});
     return success();
   }
 
@@ -1192,7 +1355,8 @@ void populateFoldUnitExtentDimsPatterns(
     RewritePatternSet &patterns, const linalg::ControlDropUnitDims &options) {
   patterns.add<DropScatterUnitIndexDepth>(patterns.getContext());
   patterns.add<DropGatherUnitDims, DropScatterUnitDims, DropAttentionUnitDims,
-               DropMapScatterUnitDims>(patterns.getContext(), options);
+               DropMapScatterUnitDims, DropArgCompareUnitDims>(
+      patterns.getContext(), options);
 }
 
 } // namespace mlir::iree_compiler::IREE::LinalgExt

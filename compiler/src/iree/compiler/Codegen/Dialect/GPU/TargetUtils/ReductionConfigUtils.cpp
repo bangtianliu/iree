@@ -834,8 +834,9 @@ LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
     }
   }
 
-  if (subgroupSize == 0)
+  if (subgroupSize == 0) {
     return failure();
+  }
 
   // Get bit width of the value type
   Type valueElemType = op.getOutputValueType().getElementType();
@@ -866,8 +867,9 @@ LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
   // Calculate parallel size
   std::optional<int64_t> parallelSize = 1;
   for (int64_t i = 0; i < inputRank; ++i) {
-    if (i == reductionDim)
+    if (i == reductionDim) {
       continue;
+    }
     if (ShapedType::isDynamic(bounds[i])) {
       parallelSize = std::nullopt;
       break;
