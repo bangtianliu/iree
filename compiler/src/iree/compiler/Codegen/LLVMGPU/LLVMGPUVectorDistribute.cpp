@@ -196,26 +196,28 @@ static LogicalResult setArgCompareAnchors(mlir::FunctionOpInterface funcOp,
                              layoutedInitIndex.getResult());
 
     // Wrap results with the same layout as inits
-    rewriter.setInsertionPointAfter(argCompareOp);
+    // Skip for 0-D vectors (full reductions) since there's nothing to
+    // distribute
+    if (initRank > 0) {
+      rewriter.setInsertionPointAfter(argCompareOp);
 
-    // Use the same layout dimensions for results (empty for 0D, filled for
-    // non-0D)
-    auto resultLayout = IREE::VectorExt::NestedLayoutAttr::get(
-        rewriter.getContext(), initSubgroupTile, initBatchTile, initOuterTile,
-        initThreadTile, initElementTile, initSubgroupStrides,
-        initThreadStrides);
+      auto resultLayout = IREE::VectorExt::NestedLayoutAttr::get(
+          rewriter.getContext(), initSubgroupTile, initBatchTile, initOuterTile,
+          initThreadTile, initElementTile, initSubgroupStrides,
+          initThreadStrides);
 
-    auto layoutedResultValue = IREE::VectorExt::ToLayoutOp::create(
-        rewriter, loc, argCompareOp.getResult(0), resultLayout);
-    auto layoutedResultIndex = IREE::VectorExt::ToLayoutOp::create(
-        rewriter, loc, argCompareOp.getResult(1), resultLayout);
+      auto layoutedResultValue = IREE::VectorExt::ToLayoutOp::create(
+          rewriter, loc, argCompareOp.getResult(0), resultLayout);
+      auto layoutedResultIndex = IREE::VectorExt::ToLayoutOp::create(
+          rewriter, loc, argCompareOp.getResult(1), resultLayout);
 
-    rewriter.replaceAllUsesExcept(argCompareOp.getResult(0),
-                                  layoutedResultValue.getResult(),
-                                  layoutedResultValue);
-    rewriter.replaceAllUsesExcept(argCompareOp.getResult(1),
-                                  layoutedResultIndex.getResult(),
-                                  layoutedResultIndex);
+      rewriter.replaceAllUsesExcept(argCompareOp.getResult(0),
+                                    layoutedResultValue.getResult(),
+                                    layoutedResultValue);
+      rewriter.replaceAllUsesExcept(argCompareOp.getResult(1),
+                                    layoutedResultIndex.getResult(),
+                                    layoutedResultIndex);
+    }
   }
 
   return success();

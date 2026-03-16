@@ -522,14 +522,15 @@ vectorizeLinalgExtArgCompare(RewriterBase &rewriter,
   ShapedType outValTy = argCompareOp.getOutputValueType();
   ShapedType outIdxTy = argCompareOp.getOutputIndexType();
 
+  // For reductions, vectorSizes comes from input shape, not output shape.
+  // Output is typically 0-D (scalar) for full reductions.
   if (vectorSizes.empty()) {
-    vectorSizes = outValTy.getShape();
+    // Fallback: use input shape if not provided
+    vectorSizes = inputValTy.getShape();
   }
 
-  // Ensure full tiles - partial tiles would require masking support.
-  if (vectorSizes != outValTy.getShape()) {
-    return failure();
-  }
+  // For init/output vectors, use the output shape (0-D for full reductions)
+  ArrayRef<int64_t> initShape = outValTy.getShape();
 
   Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
 
@@ -557,15 +558,15 @@ vectorizeLinalgExtArgCompare(RewriterBase &rewriter,
   SmallVector<Value> initVecs;
   for (Value init : argCompareOp.getDpsInits()) {
     auto initTy = cast<ShapedType>(init.getType());
-    SmallVector<Value> readIndices(vectorSizes.size(), zero);
-    auto initVecTy = VectorType::get(vectorSizes, initTy.getElementType());
+    SmallVector<Value> readIndices(initShape.size(), zero);
+    auto initVecTy = VectorType::get(initShape, initTy.getElementType());
     auto readOp = vector::TransferReadOp::create(rewriter, loc, initVecTy, init,
                                                  readIndices, std::nullopt);
     initVecs.push_back(readOp);
   }
 
-  auto outValVecTy = VectorType::get(vectorSizes, outValTy.getElementType());
-  auto outIdxVecTy = VectorType::get(vectorSizes, outIdxTy.getElementType());
+  auto outValVecTy = VectorType::get(initShape, outValTy.getElementType());
+  auto outIdxVecTy = VectorType::get(initShape, outIdxTy.getElementType());
 
   Region &srcRegion = argCompareOp.getRegion();
 
@@ -621,7 +622,7 @@ vectorizeLinalgExtArgCompare(RewriterBase &rewriter,
   SmallVector<Value> results;
   for (auto [result, output] : llvm::zip_equal(vectorArgCompareOp.getResults(),
                                                argCompareOp.getDpsInits())) {
-    SmallVector<Value> writeIndices(vectorSizes.size(), zero);
+    SmallVector<Value> writeIndices(initShape.size(), zero);
     auto writeOp = vector::TransferWriteOp::create(rewriter, loc, result,
                                                    output, writeIndices);
     results.push_back(writeOp.getResult());

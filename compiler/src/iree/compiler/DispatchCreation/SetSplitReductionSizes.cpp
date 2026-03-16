@@ -489,12 +489,11 @@ struct SetSplitReductionSizesPass final
       }
 
       // --- Case 4: Arg compare operations ---
-      // if (auto tileSizes =
-      //         getArgCompareReductionSizes(tilingOp,
-      //         splitReductionTargetSize)) {
-      //   IREE::LinalgExt::setSplitReductionAttribute(tilingOp, *tileSizes);
-      //   return;
-      // }
+      if (auto tileSizes =
+              getArgCompareReductionSizes(tilingOp, splitReductionTargetSize)) {
+        IREE::LinalgExt::setSplitReductionAttribute(tilingOp, *tileSizes);
+        return;
+      }
     });
   }
 };
