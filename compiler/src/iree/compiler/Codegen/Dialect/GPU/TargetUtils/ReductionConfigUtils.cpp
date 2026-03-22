@@ -4,6 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <cstdlib> // for std::getenv, std::atoi
+
 #include "iree/compiler/Codegen/Dialect/GPU/IR/GPULoweringConfigUtils.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Dialect/GPU/TargetUtils/ConfigUtils.h"
@@ -877,8 +879,14 @@ LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
     *parallelSize *= bounds[i];
   }
 
+  // Save original parallel size before any modifications
+  const std::optional<int64_t> originalParallelSize = parallelSize;
+
   // If there is more than enough work, use single subgroup per workgroup
-  if (parallelSize && *parallelSize > numWGPs * numSIMDs) {
+  // UNLESS overridden by environment variable
+  bool forceMultiSubgroup = std::getenv("IREE_FORCE_SUBGROUPS") != nullptr;
+  if (!forceMultiSubgroup && parallelSize &&
+      *parallelSize > numWGPs * numSIMDs) {
     maxWorkgroupSize = target.getPreferredSubgroupSize();
   }
 
@@ -899,6 +907,16 @@ LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
     *parallelSize /= 2;
   }
 
+  // BENCHMARK: Override workgroup size via environment variable
+  // Usage: IREE_FORCE_WG_SIZE=64|128|256|512|1024
+  if (const char *forceWG = std::getenv("IREE_FORCE_WG_SIZE")) {
+    int64_t forcedSize = std::atoi(forceWG);
+    if (forcedSize > 0 && reductionSize % forcedSize == 0) {
+      workgroupSize = forcedSize;
+      threadLoads = reductionSize / forcedSize;
+    }
+  }
+
   // Build the lowering config for ArgCompareOp
   // ArgCompareOp always has exactly one reduction dimension
   SmallVector<int64_t> workgroupTileSizes(inputRank, 0);
@@ -910,11 +928,16 @@ LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
   std::iota(mapping.begin(), mapping.end(), 0);
 
   // Set workgroup tile sizes for parallel dimensions
+  // For now, use 1 batch per workgroup (single reduction per workgroup).
+  // Multi-batch processing requires additional VectorDistribute logic.
   for (int64_t i = 0; i < inputRank; ++i) {
     if (i != reductionDim) {
       workgroupTileSizes[i] = 1;
     }
   }
+
+  // Note: originalParallelSize is available for future multi-batch optimization
+  (void)originalParallelSize;
 
   // Configure reduction dimension
   threadTileSizes[reductionDim] = 1;
@@ -935,6 +958,20 @@ LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
                              {64, static_cast<uint64_t>(lastReductionDimSize)})
                              .getZExtValue();
 
+  // BENCHMARK: Override partial reduction size via environment variable
+  // Usage: IREE_FORCE_PARTIAL_RED=256|512|1024|2048|4096
+  if (const char *forcePartial = std::getenv("IREE_FORCE_PARTIAL_RED")) {
+    int64_t forcedPartial = std::atoi(forcePartial);
+    if (forcedPartial > 0 && lastReductionDimSize % forcedPartial == 0) {
+      partialReductionSize = forcedPartial;
+    }
+  }
+
+  // NOTE: We considered limiting partial_reduction for batched cases to reduce
+  // LDS usage, but this increases loop iterations and hurts performance.
+  // The LDS pressure is acceptable because workgroups are scheduled serially
+  // by the GPU when LDS exceeds available memory.
+
   int64_t threadBasis = subgroupSize;
   int subgroupStride = threadBasis * threadLoads;
   while (partialReductionSize % subgroupStride != 0) {
@@ -943,6 +980,41 @@ LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
   }
   int subgroup = partialReductionSize / subgroupStride;
   int64_t subgroupBasis = (subgroup == 0) ? 1 : subgroup;
+
+  // BENCHMARK: Override number of subgroups via environment variable
+  // Usage: IREE_FORCE_SUBGROUPS=1|2|4|8|16
+  if (const char *forceSG = std::getenv("IREE_FORCE_SUBGROUPS")) {
+    int64_t forcedSG = std::atoi(forceSG);
+    if (forcedSG > 0 && forcedSG <= 16) {
+      subgroupBasis = forcedSG;
+      // Recalculate threadLoads to match the new subgroup count
+      int64_t totalThreads = forcedSG * subgroupSize;
+      threadLoads = partialReductionSize / totalThreads;
+      if (threadLoads < 1) {
+        threadLoads = 1;
+      }
+    }
+  }
+
+  // BENCHMARK: Override vector size (elements per thread) via environment
+  // variable Usage: IREE_FORCE_VECTOR_SIZE=1|2|4 Note: This overrides
+  // threadLoads and recalculates subgroup layout. If IREE_FORCE_SUBGROUPS is
+  // also set, the effective subgroup count may differ from the forced value to
+  // maintain consistency.
+  if (const char *forceVS = std::getenv("IREE_FORCE_VECTOR_SIZE")) {
+    int64_t forcedVS = std::atoi(forceVS);
+    if (forcedVS > 0 && partialReductionSize % forcedVS == 0) {
+      threadLoads = forcedVS;
+      // Recalculate threadBasis and subgroupBasis
+      threadBasis = subgroupSize;
+      int64_t stride = threadBasis * threadLoads;
+      while (partialReductionSize % stride != 0 && threadBasis > 1) {
+        threadBasis >>= 1;
+        stride = threadBasis * threadLoads;
+      }
+      subgroupBasis = partialReductionSize / stride;
+    }
+  }
 
   partialReductionTileSizes[reductionDim] = partialReductionSize;
   threadTileSizes[reductionDim] = threadLoads;

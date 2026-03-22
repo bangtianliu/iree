@@ -467,17 +467,24 @@ struct DistributeTransferWrite final
     }
     // Make the outer bound numThreadsInWorkgroup / prod(basis) to remove
     // redundant checks.
+    bool hasOuterBound = false;
     if (numThreadsInWorkgroup.has_value()) {
-      int64_t outerBound =
-          numThreadsInWorkgroup.value() / llvm::product_of(basis);
-      basis.insert(basis.begin(), outerBound);
+      int64_t basisProduct = llvm::product_of(basis);
+      int64_t outerBound = numThreadsInWorkgroup.value() / basisProduct;
+      // Only insert outer bound if it's positive. If outerBound <= 0, it means
+      // the layout requires more threads than the workgroup has, which can
+      // happen with certain subgroup/thread tile configurations. In this case,
+      // we skip the outer bound and rely on the existing basis.
+      if (outerBound > 0) {
+        basis.insert(basis.begin(), outerBound);
+        hasOuterBound = true;
+      }
     }
     // Create a delinearize operation and check that all results not present in
     // dimToResult are 0.
     SmallVector<Value> delinearized;
     b.createOrFold<affine::AffineDelinearizeIndexOp>(
-        delinearized, loc, threadId, basis,
-        /*hasOuterbound=*/numThreadsInWorkgroup.has_value());
+        delinearized, loc, threadId, basis, hasOuterBound);
     // Get all results which are not in dimToResult and check they are 0.
     Value condition = arith::ConstantOp::create(b, loc, b.getBoolAttr(true));
     for (auto [idx, result] : llvm::enumerate(delinearized)) {
