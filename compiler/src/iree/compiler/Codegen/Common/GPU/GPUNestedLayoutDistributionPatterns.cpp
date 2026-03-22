@@ -19,13 +19,10 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FormatVariadic.h"
-#include "mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/Utils/GPUUtils.h"
-#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
-#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Utils/VectorUtils.h"
@@ -2861,165 +2858,19 @@ struct DistributeArgCompare final
                           cast<VectorValue>(resultIdx));
   }
 
-  // Analyze a comparator region to determine the corresponding GPU reduce
-  // operation. The comparator must be a SIMPLE comparison - just a cmpf/cmpi
-  // directly on the block arguments, followed by a yield.
-  //
-  // Returns std::nullopt if:
-  // - The comparator has more than 2 operations (cmp + yield)
-  // - The comparison operands are not the block arguments directly
-  // - The comparison predicate doesn't map to max/min
-  //
-  // This ensures we only use SubgroupReduceOp for truly simple comparators
-  // like `cmpf ogt %arg0, %arg1` and not for complex ones like
-  // `cmpf ogt (absf %arg0), (absf %arg1)`.
-  std::optional<gpu::AllReduceOperation>
-  getReduceOpFromComparator(Region &comparatorRegion, Type elemType) const {
-    Block *block = &comparatorRegion.front();
-
-    // Count operations - should be exactly 2 (cmp + yield)
-    size_t opCount = 0;
-    for (Operation &op : block->getOperations()) {
-      (void)op;
-      ++opCount;
-    }
-    if (opCount != 2) {
-      // Complex comparator with additional operations - use fallback
-      return std::nullopt;
-    }
-
-    // Get block arguments
-    if (block->getNumArguments() != 2) {
-      return std::nullopt;
-    }
-    Value arg0 = block->getArgument(0);
-    Value arg1 = block->getArgument(1);
-
-    // Look for the comparison operation in the comparator block
-    for (Operation &op : block->getOperations()) {
-      if (auto cmpfOp = dyn_cast<arith::CmpFOp>(op)) {
-        // Verify the comparison is directly on the block arguments
-        if (cmpfOp.getLhs() != arg0 || cmpfOp.getRhs() != arg1) {
-          // Operands are not the block arguments - complex comparator
-          return std::nullopt;
-        }
-
-        // For floating-point comparisons:
-        // OGT (ordered greater than) -> argmax -> need MAXIMUMF
-        // OLT (ordered less than) -> argmin -> need MINIMUMF
-        switch (cmpfOp.getPredicate()) {
-        case arith::CmpFPredicate::OGT:
-        case arith::CmpFPredicate::OGE:
-        case arith::CmpFPredicate::UGT:
-        case arith::CmpFPredicate::UGE:
-          return gpu::AllReduceOperation::MAXIMUMF;
-        case arith::CmpFPredicate::OLT:
-        case arith::CmpFPredicate::OLE:
-        case arith::CmpFPredicate::ULT:
-        case arith::CmpFPredicate::ULE:
-          return gpu::AllReduceOperation::MINIMUMF;
-        default:
-          return std::nullopt;
-        }
-      } else if (auto cmpiOp = dyn_cast<arith::CmpIOp>(op)) {
-        // Verify the comparison is directly on the block arguments
-        if (cmpiOp.getLhs() != arg0 || cmpiOp.getRhs() != arg1) {
-          // Operands are not the block arguments - complex comparator
-          return std::nullopt;
-        }
-
-        // For integer comparisons:
-        // sgt/sge (signed greater) -> argmax -> need MAXSI
-        // slt/sle (signed less) -> argmin -> need MINSI
-        // ugt/uge (unsigned greater) -> argmax -> need MAXUI
-        // ult/ule (unsigned less) -> argmin -> need MINUI
-        switch (cmpiOp.getPredicate()) {
-        case arith::CmpIPredicate::sgt:
-        case arith::CmpIPredicate::sge:
-          return gpu::AllReduceOperation::MAXSI;
-        case arith::CmpIPredicate::slt:
-        case arith::CmpIPredicate::sle:
-          return gpu::AllReduceOperation::MINSI;
-        case arith::CmpIPredicate::ugt:
-        case arith::CmpIPredicate::uge:
-          return gpu::AllReduceOperation::MAXUI;
-        case arith::CmpIPredicate::ult:
-        case arith::CmpIPredicate::ule:
-          return gpu::AllReduceOperation::MINUI;
-        default:
-          return std::nullopt;
-        }
-      }
-    }
-    return std::nullopt;
-  }
-
-  // Create a DPP operation that performs the same data exchange as
-  // gpu::ShuffleOp with XOR mode for the given offset.
-  // Returns nullptr if the offset is not supported.
-  //
-  // XOR Shuffle to DPP Mapping:
-  //   XOR 1:  quad_perm{1,0,3,2} - swap adjacent pairs
-  //   XOR 2:  quad_perm{2,3,0,1} - swap quad halves
-  //   XOR 4:  row_half_mirror   - reverse within 8-lane half-rows
-  //   XOR 8:  row_mirror        - reverse within 16-lane rows
-  //   XOR 16: row_bcast_15      - cross-row broadcast (with row_mask=0xa)
-  //   XOR 32: row_bcast_31      - cross half-wave broadcast
-  Value createDPPShuffleXOR(RewriterBase &rewriter, Location loc, Value src,
-                            int64_t xorOffset) const {
-    constexpr int allRows = 0xf;
-    constexpr int allBanks = 0xf;
-
-    switch (xorOffset) {
-    case 1:
-      return amdgpu::DPPOp::create(
-          rewriter, loc, src.getType(), /*old=*/src, /*src=*/src,
-          amdgpu::DPPPerm::quad_perm,
-          /*permArgument=*/rewriter.getI32ArrayAttr({1, 0, 3, 2}),
-          /*row_mask=*/allRows, /*bank_mask=*/allBanks, /*bound_ctrl=*/true);
-    case 2:
-      return amdgpu::DPPOp::create(
-          rewriter, loc, src.getType(), /*old=*/src, /*src=*/src,
-          amdgpu::DPPPerm::quad_perm,
-          /*permArgument=*/rewriter.getI32ArrayAttr({2, 3, 0, 1}),
-          /*row_mask=*/allRows, /*bank_mask=*/allBanks, /*bound_ctrl=*/true);
-    case 4:
-      return amdgpu::DPPOp::create(
-          rewriter, loc, src.getType(), /*old=*/src, /*src=*/src,
-          amdgpu::DPPPerm::row_half_mirror,
-          /*permArgument=*/rewriter.getUnitAttr(),
-          /*row_mask=*/allRows, /*bank_mask=*/allBanks, /*bound_ctrl=*/true);
-    case 8:
-      return amdgpu::DPPOp::create(rewriter, loc, src.getType(), /*old=*/src,
-                                   /*src=*/src, amdgpu::DPPPerm::row_mirror,
-                                   /*permArgument=*/rewriter.getUnitAttr(),
-                                   /*row_mask=*/allRows, /*bank_mask=*/allBanks,
-                                   /*bound_ctrl=*/true);
-    // Note: XOR 16 and XOR 32 cannot be efficiently implemented with DPP
-    // row_bcast operations for custom comparators because row_bcast is a
-    // broadcast, not an exchange. The row_bcast approach only works for
-    // commutative reductions where we can use ReadlaneOp to get the final
-    // result from a specific lane. For custom comparators where we need
-    // all lanes to have the winning value (for ballot), we fall back to
-    // gpu::ShuffleOp which uses ds_bpermute.
-    case 16:
-    case 32:
-      // Fall back to ShuffleOp for these offsets.
-      return nullptr;
-    default:
-      // Fall back to nullptr for unsupported offsets.
-      return nullptr;
-    }
-  }
-
   // Helper to perform thread-level reduction for arg_compare.
   // Unlike standard reductions, this must maintain both value and index
   // vectors.
   //
-  // This implementation uses gpu::SubgroupReduceOp for the value reduction,
-  // which enables DPP optimizations on AMD GPUs. After getting the reduced
-  // value, it uses ballot + cttz to find the winning thread and shuffles
-  // the index from that thread.
+  // This implementation uses pure gpu.shuffle XOR tree for both value and
+  // index reduction. No AMD-specific operations (DPP, ballot) are used.
+  // This provides a portable baseline implementation for comparison.
+  //
+  // The algorithm performs a parallel butterfly reduction:
+  // - At each XOR shuffle step, both value and index are shuffled
+  // - The comparator determines which value wins
+  // - Tie-breaking: if values are equal, prefer smaller index
+  // - After all stages, all threads have the winning value and index
   FailureOr<std::pair<VectorValue, VectorValue>>
   doArgCompareThreadReduction(RewriterBase &rewriter, NestedLayoutAttr layout,
                               VectorValue flatVal, VectorValue flatIdx,
@@ -3029,13 +2880,7 @@ struct DistributeArgCompare final
     VectorType flatIdxType = flatIdx.getType();
     int64_t numElements = flatValType.getNumElements();
     Location loc = flatVal.getLoc();
-    Type elemType = flatValType.getElementType();
-
-    // Try to map the comparator to a SubgroupReduceOp.
-    // If successful, use SubgroupReduceOp which can be lowered to DPP.
-    // Otherwise, fall back to the shuffle-based implementation.
-    std::optional<gpu::AllReduceOperation> reduceOp =
-        getReduceOpFromComparator(comparatorRegion, elemType);
+    Type idxType = flatIdxType.getElementType();
 
     // Initialize result vectors
     auto zeroValOp = arith::ConstantOp::create(
@@ -3063,111 +2908,102 @@ struct DistributeArgCompare final
                width <= std::numeric_limits<uint32_t>::max());
 
         auto i32Type = rewriter.getI32Type();
-        auto i64Type = rewriter.getI64Type();
         Value width32 = arith::ConstantOp::create(
             rewriter, loc, rewriter.getIntegerAttr(i32Type, width));
 
-        Value currentVal;
-        if (reduceOp.has_value()) {
-          // Use SubgroupReduceOp for value reduction.
-          // This enables DPP lowering on AMD GPUs when cluster_stride == 1.
-          currentVal = gpu::SubgroupReduceOp::create(
-              rewriter, loc, extractedVal, *reduceOp,
-              /*uniform=*/false, /*cluster_size=*/width,
-              /*cluster_stride=*/offset);
-        } else {
-          // Fall back to DPP/shuffle-based butterfly reduction for complex
-          // comparators that don't map to standard reduce operations.
-          // We use amdgpu::DPPOp directly for known XOR offsets (1,2,4,8,16,32)
-          // which gives us fast v_mov_b32_dpp instead of slow ds_bpermute_b32.
-          int64_t numStages = llvm::Log2_64_Ceil(width);
-          currentVal = extractedVal;
+        // Pure gpu.shuffle XOR tree for both value and index reduction.
+        // No DPP, no ballot - just gpu.shuffle xor at all stages.
+        int64_t numStages = llvm::Log2_64_Ceil(width);
+        Value currentVal = extractedVal;
+        Value currentIdx = extractedIdx;
 
-          for (int64_t stage = 0; stage < numStages; ++stage) {
-            int64_t shuffleOffset = offset * (1 << stage);
+        for (int64_t stage = 0; stage < numStages; ++stage) {
+          int64_t shuffleOffset = offset * (1 << stage);
 
-            // Try to use DPP for the shuffle (much faster than ds_bpermute).
-            // Returns nullptr for unsupported offsets.
-            Value shuffledVal =
-                createDPPShuffleXOR(rewriter, loc, currentVal, shuffleOffset);
-            if (!shuffledVal) {
-              // Fall back to ShuffleOp for unsupported offsets.
-              Value shuffleOffset32 = arith::ConstantOp::create(
-                  rewriter, loc,
-                  rewriter.getIntegerAttr(i32Type, shuffleOffset));
-              shuffledVal = gpu::ShuffleOp::create(rewriter, loc, currentVal,
-                                                   shuffleOffset32, width32,
-                                                   gpu::ShuffleMode::XOR)
-                                .getShuffleResult();
+          // Use gpu.shuffle XOR for both value and index
+          Value shuffleOffset32 = arith::ConstantOp::create(
+              rewriter, loc, rewriter.getIntegerAttr(i32Type, shuffleOffset));
+
+          Value shuffledVal =
+              gpu::ShuffleOp::create(rewriter, loc, currentVal, shuffleOffset32,
+                                     width32, gpu::ShuffleMode::XOR)
+                  .getShuffleResult();
+
+          Value shuffledIdx =
+              gpu::ShuffleOp::create(rewriter, loc, currentIdx, shuffleOffset32,
+                                     width32, gpu::ShuffleMode::XOR)
+                  .getShuffleResult();
+
+          // Apply comparator to determine if current value wins over shuffled
+          // comparator returns true if arg0 should be selected over arg1
+          Block *comparatorBlock = &comparatorRegion.front();
+          IRMapping mapping;
+          mapping.map(comparatorBlock->getArgument(0), currentVal);
+          mapping.map(comparatorBlock->getArgument(1), shuffledVal);
+
+          Value currentWins;
+          for (Operation &op : comparatorBlock->getOperations()) {
+            if (auto yieldOp = dyn_cast<IREE::VectorExt::YieldOp>(op)) {
+              currentWins = mapping.lookup(yieldOp.getValues()[0]);
+              break;
             }
-
-            // Apply comparator to determine winner
-            Block *comparatorBlock = &comparatorRegion.front();
-            IRMapping mapping;
-            mapping.map(comparatorBlock->getArgument(0), currentVal);
-            mapping.map(comparatorBlock->getArgument(1), shuffledVal);
-
-            Value cmpResult;
-            for (Operation &op : comparatorBlock->getOperations()) {
-              if (auto yieldOp = dyn_cast<IREE::VectorExt::YieldOp>(op)) {
-                cmpResult = mapping.lookup(yieldOp.getValues()[0]);
-                break;
-              }
-              rewriter.clone(op, mapping);
-            }
-
-            if (!cmpResult) {
-              return failure();
-            }
-
-            // Update current value to the winner
-            currentVal = arith::SelectOp::create(rewriter, loc, cmpResult,
-                                                 currentVal, shuffledVal);
+            rewriter.clone(op, mapping);
           }
+
+          if (!currentWins) {
+            return failure();
+          }
+
+          // Also check if shuffled value wins over current
+          IRMapping reverseMapping;
+          reverseMapping.map(comparatorBlock->getArgument(0), shuffledVal);
+          reverseMapping.map(comparatorBlock->getArgument(1), currentVal);
+
+          Value shuffledWins;
+          for (Operation &op : comparatorBlock->getOperations()) {
+            if (auto yieldOp = dyn_cast<IREE::VectorExt::YieldOp>(op)) {
+              shuffledWins = reverseMapping.lookup(yieldOp.getValues()[0]);
+              break;
+            }
+            rewriter.clone(op, reverseMapping);
+          }
+
+          // Tie-breaking logic:
+          // - If currentWins is true, keep current
+          // - If shuffledWins is true, take shuffled
+          // - If neither (values are equal), prefer smaller index
+          Value valuesEqual = arith::XOrIOp::create(
+              rewriter, loc,
+              arith::ConstantOp::create(rewriter, loc,
+                                        rewriter.getBoolAttr(true)),
+              arith::OrIOp::create(rewriter, loc, currentWins, shuffledWins));
+
+          Value idxSmaller;
+          if (isa<IntegerType>(idxType)) {
+            idxSmaller =
+                arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::slt,
+                                      currentIdx, shuffledIdx);
+          } else {
+            // For float indices (unusual but possible)
+            idxSmaller =
+                arith::CmpFOp::create(rewriter, loc, arith::CmpFPredicate::OLT,
+                                      currentIdx, shuffledIdx);
+          }
+
+          // preferCurrent = currentWins OR (valuesEqual AND idxSmaller)
+          Value preferCurrent = arith::OrIOp::create(
+              rewriter, loc, currentWins,
+              arith::AndIOp::create(rewriter, loc, valuesEqual, idxSmaller));
+
+          // Select winners for both value and index
+          currentVal = arith::SelectOp::create(rewriter, loc, preferCurrent,
+                                               currentVal, shuffledVal);
+          currentIdx = arith::SelectOp::create(rewriter, loc, preferCurrent,
+                                               currentIdx, shuffledIdx);
         }
-
-        // Now we have the winning value in all threads of this reduction group.
-        // Use ballot to find which thread(s) have this winning value.
-
-        // Create a ballot condition: does my original value equal the winning
-        // value?
-        Value myValueIsWinner;
-        if (isa<FloatType>(elemType)) {
-          myValueIsWinner =
-              arith::CmpFOp::create(rewriter, loc, arith::CmpFPredicate::OEQ,
-                                    extractedVal, currentVal);
-        } else {
-          myValueIsWinner =
-              arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq,
-                                    extractedVal, currentVal);
-        }
-
-        // Use ROCDL ballot to get bitmask of threads with winning value.
-        // rocdl.ballot returns i64 bitmask where bit N is set if thread N has
-        // true condition.
-        auto ballotOp =
-            ROCDL::BallotOp::create(rewriter, loc, i64Type, myValueIsWinner);
-        Value winnerMask = ballotOp.getResult();
-
-        // Find the thread with the smallest index among winners.
-        // This is the lowest set bit in the ballot mask.
-        // cttz returns the number of trailing zeros = index of first set bit.
-        Value winningThreadIdI64 = math::CountTrailingZerosOp::create(
-            rewriter, loc, i64Type, winnerMask);
-
-        // Truncate to i32 for the shuffle operation.
-        Value winningThreadId =
-            arith::TruncIOp::create(rewriter, loc, i32Type, winningThreadIdI64);
-
-        // Shuffle to get the index from the winning thread.
-        // Use gpu.shuffle with mode IDX to get value from specific thread.
-        Value winningIdx =
-            gpu::ShuffleOp::create(rewriter, loc, extractedIdx, winningThreadId,
-                                   width32, gpu::ShuffleMode::IDX)
-                .getShuffleResult();
 
         extractedVal = currentVal;
-        extractedIdx = winningIdx;
+        extractedIdx = currentIdx;
       }
 
       // Insert the reduced value and index back into result vectors
