@@ -2816,17 +2816,22 @@ struct DistributeArgCompare final
       Value idxLess = arith::CmpIOp::create(
           rewriter, loc, arith::CmpIPredicate::slt, elemIdx, accIdx);
 
-      // preferElem = !cmpResult || (tie && elemIdx < accIdx)
+      // preferElem = elemStrictlyWins || (tie && elemIdx < accIdx)
       // i.e., prefer new element if:
-      //   - accumulator doesn't win (!cmpResult), OR
+      //   - element strictly wins (acc doesn't win AND not a tie), OR
       //   - it's a tie and new element has smaller index
       Value notAccWins = arith::XOrIOp::create(
           rewriter, loc, cmpResult,
           arith::ConstantOp::create(rewriter, loc, rewriter.getBoolAttr(true)));
+      Value notTie = arith::XOrIOp::create(
+          rewriter, loc, tieCondition,
+          arith::ConstantOp::create(rewriter, loc, rewriter.getBoolAttr(true)));
+      Value elemStrictlyWins =
+          arith::AndIOp::create(rewriter, loc, notAccWins, notTie);
       Value tieAndSmaller =
           arith::AndIOp::create(rewriter, loc, tieCondition, idxLess);
       Value preferElem =
-          arith::OrIOp::create(rewriter, loc, notAccWins, tieAndSmaller);
+          arith::OrIOp::create(rewriter, loc, elemStrictlyWins, tieAndSmaller);
 
       // Update accumulator
       accVal =
