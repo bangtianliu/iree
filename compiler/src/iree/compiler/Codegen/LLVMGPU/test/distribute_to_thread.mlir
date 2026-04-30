@@ -357,3 +357,72 @@ module {
 
 // Check that we are able to distribute correctly
 // CHECK-LABEL: func.func @contract_4d
+
+// -----
+
+// Multi-wave workgroup: arg_compare must be wrapped with barriers + scf.if so a
+// single thread executes it. Mirrors the RDNA3 race fix.
+
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+#translation = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<Vectorize> workgroup_size = [64, 1, 1]>
+func.func @arg_compare_serialized() attributes {translation_info = #translation} {
+  %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) : memref<2x12xf32>
+  %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) : memref<12xf32>
+  %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) : memref<12xi32>
+  iree_linalg_ext.arg_compare
+    dimension(0)
+    ins(%0 : memref<2x12xf32>)
+    outs(%1, %2 : memref<12xf32>, memref<12xi32>) {
+    ^bb0(%a: f32, %b: f32):
+      %cmp = arith.cmpf ogt, %a, %b : f32
+      iree_linalg_ext.yield %cmp : i1
+  }
+  return
+}
+
+// CHECK-LABEL: func.func @arg_compare_serialized
+//       CHECK:   gpu.barrier
+//   CHECK-DAG:   %[[TZ:.+]] = gpu.thread_id z
+//   CHECK-DAG:   %[[TY:.+]] = gpu.thread_id y
+//   CHECK-DAG:   %[[TX:.+]] = gpu.thread_id x
+//       CHECK:   %[[LIN:.+]] = affine.linearize_index disjoint [%[[TZ]], %[[TY]], %[[TX]]] by (1, 1, 64)
+//       CHECK:   %[[C0:.+]] = arith.constant 0 : index
+//       CHECK:   %[[COND:.+]] = arith.cmpi eq, %[[LIN]], %[[C0]]
+//       CHECK:   scf.if %[[COND]] {
+//       CHECK:     iree_linalg_ext.arg_compare
+//       CHECK:   }
+//       CHECK:   gpu.barrier
+
+// -----
+
+// Single-thread workgroup: no race possible, helper must skip the wrap.
+
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+#translation = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<Vectorize> workgroup_size = [1, 1, 1]>
+func.func @arg_compare_single_thread_no_wrap() attributes {translation_info = #translation} {
+  %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) : memref<2x12xf32>
+  %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) : memref<12xf32>
+  %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) : memref<12xi32>
+  iree_linalg_ext.arg_compare
+    dimension(0)
+    ins(%0 : memref<2x12xf32>)
+    outs(%1, %2 : memref<12xf32>, memref<12xi32>) {
+    ^bb0(%a: f32, %b: f32):
+      %cmp = arith.cmpf ogt, %a, %b : f32
+      iree_linalg_ext.yield %cmp : i1
+  }
+  return
+}
+
+// CHECK-LABEL: func.func @arg_compare_single_thread_no_wrap
+//   CHECK-NOT:   gpu.barrier
+//   CHECK-NOT:   scf.if
+//       CHECK:   iree_linalg_ext.arg_compare

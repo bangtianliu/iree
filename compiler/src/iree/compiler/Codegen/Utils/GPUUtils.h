@@ -135,6 +135,24 @@ void propagateSharedMemoryCopy(mlir::FunctionOpInterface funcOp);
 /// Inserts barriers before and after shared memory copy.
 void insertBarriersAroundSharedMemoryCopy(mlir::FunctionOpInterface funcOp);
 
+/// Wraps every un-distributed `iree_linalg_ext.arg_compare` in `funcOp` that
+/// has pure buffer semantics with `gpu.barrier` + `scf.if (linear_thread_id ==
+/// 0) { ... }` + `gpu.barrier`, so a single thread executes the op and the
+/// surrounding barriers make its writes visible to the rest of the workgroup.
+///
+/// Intended for the LLVMGPU `Distribute` pipeline, where
+/// `LLVMGPUTileAndDistribute` (linalg-only) leaves `arg_compare` un-tiled.
+/// Without this wrap, all threads of the workgroup execute the lowered loop
+/// and race on the shared output. Skipped when the workgroup-size product is
+/// 1 (no race possible) or when the workgroup size is unavailable.
+///
+/// The helper assumes top-level (function-body) `arg_compare` ops in
+/// thread-uniform control flow, which holds for the simple Distribute
+/// pipeline. Ops nested inside any `scf.if` are skipped (conservative — even
+/// uniform `scf.if` is rejected).
+LogicalResult
+serializeArgCompareToSingleThread(mlir::FunctionOpInterface funcOp);
+
 /// Emit reduction across a group for a given input. Emits `gpu.shuffle`
 /// based reduction only when `expandSubgroupReduce` is set.
 Value emitGPUGroupReduction(Location loc, OpBuilder &builder, Value input,

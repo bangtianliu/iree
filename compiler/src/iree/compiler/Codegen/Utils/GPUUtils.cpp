@@ -12,6 +12,7 @@
 #include "iree/compiler/Codegen/Utils/MarkerUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DebugLog.h"
@@ -22,6 +23,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
@@ -389,6 +391,95 @@ void insertBarriersAroundSharedMemoryCopy(mlir::FunctionOpInterface funcOp) {
       }
     }
   });
+}
+
+// True if `op` lives only inside thread-uniform control flow under `funcOp`,
+// so wrapping it in `gpu.barrier` + `scf.if` is safe (no risk of
+// thread-divergent barriers). Conservatively rejects ops nested inside any
+// `scf.if` ancestor.
+static bool isInThreadUniformControlFlow(Operation *op,
+                                         mlir::FunctionOpInterface funcOp) {
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (parent == funcOp.getOperation()) {
+      return true;
+    }
+    if (isa<scf::IfOp>(parent)) {
+      return false;
+    }
+  }
+  return false;
+}
+
+LogicalResult
+serializeArgCompareToSingleThread(mlir::FunctionOpInterface funcOp) {
+  std::optional<SmallVector<int64_t>> maybeWorkgroupSize =
+      getWorkgroupSize(funcOp);
+  if (!maybeWorkgroupSize) {
+    return success();
+  }
+
+  // Pad to (x, y, z) with trailing 1s so the linearization basis below is
+  // always 3D.
+  std::array<int64_t, 3> workgroupSize = {1, 1, 1};
+  for (auto [i, value] : llvm::enumerate(*maybeWorkgroupSize)) {
+    if (i >= workgroupSize.size()) {
+      break;
+    }
+    workgroupSize[i] = value;
+  }
+  if (workgroupSize[0] * workgroupSize[1] * workgroupSize[2] <= 1) {
+    return success();
+  }
+
+  // TODO: widen to other un-distributed `LinalgExtOp` interface ops in a
+  // follow-up if other ops surface the same race; arg_compare is the only one
+  // observed today.
+  SmallVector<IREE::LinalgExt::ArgCompareOp> candidates;
+  funcOp.walk([&](IREE::LinalgExt::ArgCompareOp op) {
+    if (!op.hasPureBufferSemantics()) {
+      return;
+    }
+    if (!isInThreadUniformControlFlow(op, funcOp)) {
+      return;
+    }
+    candidates.push_back(op);
+  });
+  if (candidates.empty()) {
+    return success();
+  }
+
+  // AffineLinearizeIndexOp expects basis in slowest-to-fastest order. We
+  // build threadGrid as (tid_z, tid_y, tid_x), so basis is (Bz, By, Bx).
+  SmallVector<int64_t> reversedSize(llvm::reverse(workgroupSize));
+
+  OpBuilder builder(funcOp.getContext());
+  for (IREE::LinalgExt::ArgCompareOp op : candidates) {
+    Location loc = op.getLoc();
+
+    builder.setInsertionPoint(op);
+    gpu::BarrierOp::create(builder, loc, gpu::AddressSpace::Workgroup);
+
+    SmallVector<Value> threadGrid = {
+        builder.createOrFold<gpu::ThreadIdOp>(loc, gpu::Dimension::z),
+        builder.createOrFold<gpu::ThreadIdOp>(loc, gpu::Dimension::y),
+        builder.createOrFold<gpu::ThreadIdOp>(loc, gpu::Dimension::x)};
+
+    Value linearTid = affine::AffineLinearizeIndexOp::create(
+        builder, loc, threadGrid, reversedSize, /*disjoint=*/true);
+
+    Value zero = arith::ConstantIndexOp::create(builder, loc, 0);
+    Value cond = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::eq,
+                                       linearTid, zero);
+
+    auto ifOp = scf::IfOp::create(builder, loc, cond);
+    op->moveBefore(ifOp.thenYield());
+
+    builder.setInsertionPointAfter(ifOp);
+    gpu::BarrierOp::create(builder, loc, gpu::AddressSpace::Workgroup);
+  }
+
+  return success();
 }
 
 //===----------------------------------------------------------------------===//

@@ -304,6 +304,14 @@ public:
       }
     }
 
+    // `distributeLinalgOpsWithFilter` only walks `linalg::LinalgOp`, leaving
+    // un-distributed `iree_linalg_ext.arg_compare` ops in the function body.
+    // Without serialization, every thread of the workgroup executes the
+    // lowered loop and races on the shared output (see issue write-up).
+    if (failed(serializeArgCompareToSingleThread(funcOp))) {
+      return signalPassFailure();
+    }
+
     LLVM_DEBUG({
       llvm::dbgs() << "After tile and distribute to threads:";
       funcOp.dump();
