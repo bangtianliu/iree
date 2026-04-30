@@ -647,7 +647,9 @@ def GenericVectorizationPass :
             /*default=*/"2147483647",
            "Max vector size allowed to avoid creating large vectors.">,
     Option<"vectorizeMapStore", "vectorize-map-store", "bool", /*default=*/"false",
-      "Enable vectorization of iree_linalg_ext.map_store operations via VectorizableOpInterface.">
+      "Enable vectorization of iree_linalg_ext.map_store operations via VectorizableOpInterface.">,
+    Option<"vectorizeArgCompare", "vectorize-arg-compare", "bool", /*default=*/"true",
+      "Enable vectorization of iree_linalg_ext.arg_compare operations via VectorizableOpInterface.">
   ];
   let dependentDialects = [
     "::mlir::arith::ArithDialect"
