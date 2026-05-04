@@ -2102,9 +2102,12 @@ LogicalResult setArgCompareConfig(IREE::GPU::TargetAttr target,
   };
 
   // No parallel dims (e.g. rank-1 input reducing to a scalar) means there is
-  // nothing for the TileAndFuse pipeline to distribute across threads, and the
-  // resulting `tile = [0]` config trips downstream tiling passes. Bail out and
-  // let the dispatcher fall through to `setRootDefaultConfig`.
+  // nothing to distribute across threads. Emitting a `[0]`-length tile config
+  // for a rank-0 result trips downstream passes (GPUGreedilyDistributeToThreads
+  // crashes on rank-0 iteration targets when fused with `linalg.fill`).
+  // Bail out and let the dispatcher fall through to setRootDefaultConfig; for
+  // rank-1 reducing to a scalar the race in the default pipeline is benign
+  // because every thread computes the same value.
   if (partitionedLoops.empty()) {
     return failure();
   }
@@ -2151,6 +2154,18 @@ LogicalResult setArgCompareConfig(IREE::GPU::TargetAttr target,
       workgroupTileSizes[depth] = residualWorkgroupSize;
       break;
     }
+  }
+
+  // If the parallel iterations actually packed into the workgroup tile fit in
+  // a single subgroup, drop to one warp so we don't launch idle threads.
+  int64_t cumulativeWorkgroupTile = 1;
+  for (int64_t depth : llvm::seq<int64_t>(0, numLoops)) {
+    if (partitionedLoopsSet.contains(depth) && workgroupTileSizes[depth] > 0) {
+      cumulativeWorkgroupTile *= workgroupTileSizes[depth];
+    }
+  }
+  if (cumulativeWorkgroupTile <= subgroupSize) {
+    workgroupSize[0] = subgroupSize;
   }
 
   IREE::GPU::LoweringConfigAttr loweringConfig =
