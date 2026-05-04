@@ -2082,8 +2082,6 @@ LogicalResult setSortConfig(IREE::GPU::TargetAttr target,
 LogicalResult setArgCompareConfig(IREE::GPU::TargetAttr target,
                                   mlir::FunctionOpInterface entryPoint,
                                   Operation *op) {
-  assert(isa<IREE::LinalgExt::ArgCompareOp>(op) &&
-         "expected linalg_ext.arg_compare op");
   auto argCompareOp = cast<IREE::LinalgExt::ArgCompareOp>(op);
   MLIRContext *context = op->getContext();
   Builder b(context);
@@ -2097,8 +2095,8 @@ LogicalResult setArgCompareConfig(IREE::GPU::TargetAttr target,
                                   ArrayRef<int64_t> threadSizes) {
     NamedAttribute attrs[2] = {{"workgroup", b.getI64ArrayAttr(workgroupSizes)},
                                {"thread", b.getI64ArrayAttr(threadSizes)}};
-    auto configDict = b.getDictionaryAttr(attrs);
-    return IREE::GPU::LoweringConfigAttr::get(context, configDict);
+    return IREE::GPU::LoweringConfigAttr::get(context,
+                                              b.getDictionaryAttr(attrs));
   };
 
   // No parallel dims (e.g. rank-1 input reducing to a scalar) means there is
