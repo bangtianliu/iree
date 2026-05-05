@@ -294,3 +294,33 @@ func.func @argcompare_f64_fallback(
 // CHECK:         iree_linalg_ext.arg_compare
 // CHECK-SAME:      lowering_config = #iree_gpu.lowering_config<{thread = [{{[0-9]+}}, 0],
 // CHECK-SAME:        workgroup = [{{[0-9]+}}, 0]}>
+
+// -----
+
+// Rank-1 input reducing to a scalar: the only iteration loop is the reduction
+// dim, so there are no parallel loops to distribute across threads.
+// setReductionConfig rejects (reduction size 5 below subgroup), and
+// setArgCompareConfig emits a degenerate single-thread TileAndFuse config
+// (workgroup_size = [1, 1, 1], tile = [0]) so the lone thread runs the full
+// scan once.
+
+func.func @argcompare_1d_rank_to_scalar_f32(
+    %input: tensor<5xf32>,
+    %out_val: tensor<f32>,
+    %out_idx: tensor<i32>) -> (tensor<f32>, tensor<i32>) {
+  %0:2 = iree_linalg_ext.arg_compare
+    dimension(0)
+    ins(%input : tensor<5xf32>)
+    outs(%out_val, %out_idx : tensor<f32>, tensor<i32>) {
+    ^bb0(%a: f32, %b: f32):
+      %cmp = arith.cmpf ogt, %a, %b : f32
+      iree_linalg_ext.yield %cmp : i1
+  } -> tensor<f32>, tensor<i32>
+  return %0#0, %0#1 : tensor<f32>, tensor<i32>
+}
+
+// CHECK:       #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse>
+// CHECK-SAME:    workgroup_size = [1, 1, 1] subgroup_size = 64
+// CHECK-LABEL: func.func @argcompare_1d_rank_to_scalar_f32
+// CHECK:         iree_linalg_ext.arg_compare
+// CHECK-SAME:      lowering_config = #iree_gpu.lowering_config<{thread = [0], workgroup = [0]}>

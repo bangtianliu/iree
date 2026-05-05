@@ -2100,14 +2100,20 @@ LogicalResult setArgCompareConfig(IREE::GPU::TargetAttr target,
   };
 
   // No parallel dims (e.g. rank-1 input reducing to a scalar) means there is
-  // nothing to distribute across threads. Emitting a `[0]`-length tile config
-  // for a rank-0 result trips downstream passes (GPUGreedilyDistributeToThreads
-  // crashes on rank-0 iteration targets when fused with `linalg.fill`).
-  // Bail out and let the dispatcher fall through to setRootDefaultConfig; for
-  // rank-1 reducing to a scalar the race in the default pipeline is benign
-  // because every thread computes the same value.
+  // nothing to distribute across threads. Emit a degenerate single-thread
+  // TileAndFuse config instead of bailing: the per-loop tile size is 0 for
+  // every reduction loop, so a single thread walks the full reduction once
+  // without racing.
   if (partitionedLoops.empty()) {
-    return failure();
+    int64_t numLoops = argCompareOp.getInputRank();
+    SmallVector<int64_t> zeroTileSizes(numLoops, 0);
+    IREE::GPU::LoweringConfigAttr loweringConfig =
+        createLoweringConfig(zeroTileSizes, zeroTileSizes);
+    std::array<int64_t, 3> singleThread = {1, 1, 1};
+    return setOpConfigAndEntryPointFnTranslation(
+        entryPoint, op, loweringConfig,
+        getGPUTranslationInfo(op->getContext(), LoweringPipeline::TileAndFuse,
+                              singleThread, subgroupSize));
   }
 
   // arg_compare's iteration domain has one loop per input dim; the single
