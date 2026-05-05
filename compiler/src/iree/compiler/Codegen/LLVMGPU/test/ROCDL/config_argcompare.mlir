@@ -234,11 +234,10 @@ func.func @argcompare_small_reduction_f32(
 }
 
 // CHECK:       #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse>
-// CHECK-SAME:    workgroup_size = [{{[0-9]+}}, 1, 1] subgroup_size = 64
+// CHECK-SAME:    workgroup_size = [64, 1, 1] subgroup_size = 64
 // CHECK-LABEL: func.func @argcompare_small_reduction_f32
 // CHECK:         iree_linalg_ext.arg_compare
-// CHECK-SAME:      lowering_config = #iree_gpu.lowering_config<{thread = [0,
-// CHECK-SAME:        workgroup = [0,
+// CHECK-SAME:      lowering_config = #iree_gpu.lowering_config<{thread = [0, 1, 1], workgroup = [0, 1, 4]}>
 
 // -----
 
@@ -263,11 +262,10 @@ func.func @argcompare_unaligned_reduction_f32(
 }
 
 // CHECK:       #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse>
-// CHECK-SAME:    workgroup_size = [{{[0-9]+}}, 1, 1] subgroup_size = 64
+// CHECK-SAME:    workgroup_size = [64, 1, 1] subgroup_size = 64
 // CHECK-LABEL: func.func @argcompare_unaligned_reduction_f32
 // CHECK:         iree_linalg_ext.arg_compare
-// CHECK-SAME:      lowering_config = #iree_gpu.lowering_config<{thread = [{{[0-9]+}}, 0],
-// CHECK-SAME:        workgroup = [{{[0-9]+}}, 0]}>
+// CHECK-SAME:      lowering_config = #iree_gpu.lowering_config<{thread = [1, 0], workgroup = [8, 0]}>
 
 // -----
 
@@ -289,11 +287,10 @@ func.func @argcompare_f64_fallback(
 }
 
 // CHECK:       #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse>
-// CHECK-SAME:    workgroup_size = [{{[0-9]+}}, 1, 1] subgroup_size = 64
+// CHECK-SAME:    workgroup_size = [64, 1, 1] subgroup_size = 64
 // CHECK-LABEL: func.func @argcompare_f64_fallback
 // CHECK:         iree_linalg_ext.arg_compare
-// CHECK-SAME:      lowering_config = #iree_gpu.lowering_config<{thread = [{{[0-9]+}}, 0],
-// CHECK-SAME:        workgroup = [{{[0-9]+}}, 0]}>
+// CHECK-SAME:      lowering_config = #iree_gpu.lowering_config<{thread = [1, 0], workgroup = [8, 0]}>
 
 // -----
 
