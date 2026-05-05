@@ -579,9 +579,8 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
   // distribution patterns owned by the VectorDistribute pipeline. Ops routed
   // to TileAndFuse (small reductions, f64) need the scalar-loop lowering from
   // `LinalgExtToLoops` instead. This gate is intentionally narrow.
-  // TODO(https://github.com/iree-org/iree/issues/24309): Remove this option
-  // once a TileAndFuse-compatible lowering for `iree_vector_ext.arg_compare`
-  // exists.
+  // TODO(#24365): Remove this option once a generic vector lowering for
+  // `iree_vector_ext.arg_compare` exists.
   addGPUVectorizationPasses(funcPassManager, /*vectorizeCopies=*/false,
                             /*enableMasking=*/true,
                             /*foldIdentitySlices=*/true,
