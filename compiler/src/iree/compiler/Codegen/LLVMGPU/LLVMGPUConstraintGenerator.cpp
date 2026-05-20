@@ -51,6 +51,8 @@ constexpr StringLiteral kKnobWorkgroupKey = "workgroup";
 constexpr StringLiteral kKnobReductionKey = "reduction";
 constexpr StringLiteral kKnobMmaKindKey = "mma_kind";
 constexpr StringLiteral kKnobSubgroupBasisKey = "subgroup_basis";
+constexpr StringLiteral kKnobSubgroupKey = "subgroup";
+constexpr StringLiteral kKnobPromoteOperandsKey = "promote_operands";
 constexpr StringLiteral kKnobWorkgroupSizeKey = "workgroup_size";
 constexpr StringLiteral kKnobSubgroupSizeKey = "subgroup_size";
 
@@ -67,6 +69,11 @@ constexpr StringLiteral kKnobWgSizeZName = "wg_size_z";
 // per problem, so names are built at runtime as prefix + dim idx.
 constexpr StringLiteral kKnobWgPrefix = "wg_";
 constexpr StringLiteral kKnobRedPrefix = "red_";
+// Per-loop subgroup tile size knobs (TileAndFuse). Sibling to `wg_`/`red_`:
+// each one represents the number of MMA tiles a single subgroup covers along
+// that loop. The subgroup *count* is derived (wg_tile / (sg_tile * mma)),
+// not knobbed directly — different from VectorDistribute's sg_m_cnt/sg_n_cnt.
+constexpr StringLiteral kKnobSgPrefix = "sg_";
 
 // Default value for dims that are not knobbed.
 constexpr int64_t kNoTileDimVal = 0;
@@ -103,6 +110,13 @@ static void assertBounds(OpBuilder &builder, Location loc, Value val,
             llvm::join_items("", name, " >= ", loName));
   assertCmp(builder, loc, smt::IntPredicate::le, val, hi,
             llvm::join_items("", name, " <= ", hiName));
+}
+
+/// Assert: lhs == rhs.
+static void assertEq(OpBuilder &builder, Location loc, Value lhs, Value rhs,
+                     StringRef msg) {
+  Value eq = smt::EqOp::create(builder, loc, lhs, rhs);
+  AssertOp::create(builder, loc, eq, msg);
 }
 
 /// Helper to build a knob variable name from a prefix.
@@ -600,6 +614,356 @@ emitVectorDistributeConstraintsForOp(Operation *rootOp, RootOpAttr rootOpAttr) {
                                          shell.smtDimArgs, compatibleMMAs);
 }
 
+/// Build the TileAndFuse knobs dict for a contraction (matmul) op.
+///
+/// Layout mirrors the TaF lowering_config schema observed in
+/// `ROCDL/config_tile_and_fuse.mlir`:
+///   workgroup        = [..., wg_<m>, wg_<n>, 0, ...]
+///   reduction        = [..., 0, 0, ..., red_<k>]
+///   subgroup         = [..., sg_<m>, sg_<n>, 0, ...]
+///   mma_kind         = one_of_knob<mma_idx, [<compatible MMAs>]>
+///   promote_operands = [0, 1]                    (fixed for v0)
+///   workgroup_size   = [wg_size_x, 1, 1]         (TaF is 1D)
+///   subgroup_size    = sg_size
+///
+/// Notes:
+///   - Only innermost M/N/K loops carry knobs (v0); outer M/N/batch dims
+///     are pinned to 1 and other loops to 0 — see PR #24484.
+///   - workgroup_size y/z are fixed in the template rather than knobbed;
+///     this avoids two trivial SMT assertions and lets the verifier reject
+///     non-1D TaF lowering configs by template mismatch.
+static DictionaryAttr
+buildTileAndFuseKnobsDict(MLIRContext *ctx, const RootOpLoopInfo &loopInfo,
+                          const ContractionLikeDims &dims,
+                          ArrayRef<Attribute> compatibleMMAs) {
+  SmallVector<NamedAttribute> knobsEntries;
+
+  // workgroup: 0 for untiled dims, 1 for batch and outer M/N (only innermost
+  // M/N are knobbed in v0).
+  SmallVector<Attribute> workgroupEntries(loopInfo.numLoops,
+                                          makeIntAttr(ctx, kNoTileDimVal));
+  SmallVector<unsigned> unitWorkgroupDims;
+  llvm::append_range(unitWorkgroupDims, dims.b);
+  llvm::append_range(unitWorkgroupDims, dims.m);
+  llvm::append_range(unitWorkgroupDims, dims.n);
+  for (unsigned i : unitWorkgroupDims) {
+    workgroupEntries[i] = makeIntAttr(ctx, kUnitTileDimVal);
+  }
+  workgroupEntries[dims.m.back()] =
+      IntKnobAttr::get(ctx, makeVarName(kKnobWgPrefix, dims.m.back()));
+  workgroupEntries[dims.n.back()] =
+      IntKnobAttr::get(ctx, makeVarName(kKnobWgPrefix, dims.n.back()));
+  knobsEntries.emplace_back(kKnobWorkgroupKey,
+                            ArrayAttr::get(ctx, workgroupEntries));
+
+  // reduction: complement of unit workgroup dims; innermost K is knobbed.
+  SmallVector<Attribute> reductionEntries(loopInfo.numLoops,
+                                          makeIntAttr(ctx, kNoTileDimVal));
+  for (unsigned i = 0; i < loopInfo.numLoops; ++i) {
+    if (llvm::is_contained(unitWorkgroupDims, i)) {
+      continue;
+    }
+    reductionEntries[i] = makeIntAttr(ctx, kUnitTileDimVal);
+  }
+  reductionEntries[dims.k.back()] =
+      IntKnobAttr::get(ctx, makeVarName(kKnobRedPrefix, dims.k.back()));
+  knobsEntries.emplace_back(kKnobReductionKey,
+                            ArrayAttr::get(ctx, reductionEntries));
+
+  // subgroup: 0 elsewhere; innermost M/N carry per-loop sg_<dim> knobs.
+  SmallVector<Attribute> subgroupEntries(loopInfo.numLoops,
+                                         makeIntAttr(ctx, kNoTileDimVal));
+  subgroupEntries[dims.m.back()] =
+      IntKnobAttr::get(ctx, makeVarName(kKnobSgPrefix, dims.m.back()));
+  subgroupEntries[dims.n.back()] =
+      IntKnobAttr::get(ctx, makeVarName(kKnobSgPrefix, dims.n.back()));
+  knobsEntries.emplace_back(kKnobSubgroupKey,
+                            ArrayAttr::get(ctx, subgroupEntries));
+
+  // mma_kind: discrete choice over compatible intrinsics.
+  knobsEntries.emplace_back(
+      kKnobMmaKindKey,
+      OneOfKnobAttr::get(ctx, kKnobMmaIdxName, compatibleMMAs));
+
+  // promote_operands: fixed [0, 1] for v0 matmul (lhs + rhs to LDS).
+  SmallVector<Attribute> promoteEntries = {makeIntAttr(ctx, 0),
+                                           makeIntAttr(ctx, 1)};
+  knobsEntries.emplace_back(kKnobPromoteOperandsKey,
+                            ArrayAttr::get(ctx, promoteEntries));
+
+  // workgroup_size: TaF is 1D, so y and z are pinned to 1 in the template.
+  SmallVector<Attribute> wgSizeKnobs = {IntKnobAttr::get(ctx, kKnobWgSizeXName),
+                                        makeIntAttr(ctx, 1),
+                                        makeIntAttr(ctx, 1)};
+  knobsEntries.emplace_back(kKnobWorkgroupSizeKey,
+                            ArrayAttr::get(ctx, wgSizeKnobs));
+  knobsEntries.emplace_back(kKnobSubgroupSizeKey,
+                            IntKnobAttr::get(ctx, kKnobSgSizeName));
+
+  return DictionaryAttr::get(ctx, knobsEntries);
+}
+
+/// Emit TileAndFuse constraints for a matmul-like contraction.
+/// Ported from the tuner's `generate_tile_and_fuse_constraints`
+/// (amdsharktuner/rocm/rocm_dispatch_constraints.py lines 311-401), v0:
+///   - innermost M/N/K dims only;
+///   - per-loop subgroup tile sizes (TaF) instead of subgroup counts (VD);
+///   - 1D workgroup;
+///   - sub-byte element types currently rejected (TODO below).
+///
+/// TODO(#23535): The constants 512 (VGPR cap), 32 (subgroup-count cap), and
+/// 10 (sg_num cap) come straight from the tuner; they should be derived
+/// from the target descriptor once available.
+static LogicalResult emitTileAndFuseConstraints(
+    OpBuilder &builder, linalg::LinalgOp linalgOp,
+    const ContractionLikeDims &dims, IREE::GPU::TargetAttr gpuTarget,
+    ArrayRef<Value> smtDimArgs, ArrayRef<Attribute> compatibleMMAs) {
+  Location loc = linalgOp.getLoc();
+
+  // Sub-byte element types would silently zero out the shared-memory
+  // budget below (`bitwidth / 8 == 0`). Skip emission for v0 — the
+  // generic codegen still works, just without tuner pruning on this op.
+  // TODO(#23535): switch to a bits-based LDS budget to support i4/fp4/i2.
+  auto lhsType =
+      cast<ShapedType>(linalgOp.getDpsInputOperand(0)->get().getType());
+  auto rhsType =
+      cast<ShapedType>(linalgOp.getDpsInputOperand(1)->get().getType());
+  unsigned lhsBitWidth = lhsType.getElementTypeBitWidth();
+  unsigned rhsBitWidth = rhsType.getElementTypeBitWidth();
+  if (lhsBitWidth < 8 || rhsBitWidth < 8) {
+    return success();
+  }
+
+  // Hardware constants.
+  Value subgroupSizeVal =
+      mkIntConst(builder, loc, gpuTarget.getPreferredSubgroupSize());
+  Value maxThreadsVal = mkIntConst(
+      builder, loc, gpuTarget.getWgp().getMaxThreadCountPerWorkgroup());
+  Value maxSharedMemVal =
+      mkIntConst(builder, loc, gpuTarget.getWgp().getMaxWorkgroupMemoryBytes());
+  // VGPR-budgeted upper bound on a single tile axis (gfx942: 256 VGPRs/thread
+  // at 64-thread subgroup with fp32 ≈ 512 elements/axis). Same magic number
+  // as the VectorDistribute path; revisit once the target descriptor exposes
+  // per-thread VGPR count.
+  Value maxVGPRsVal = mkIntConst(builder, loc, 512);
+  Value oneVal = mkIntConst(builder, loc, 1);
+
+  // Only innermost M, N, and K dims get constrained (v0).
+  unsigned mDim = dims.m.back();
+  unsigned nDim = dims.n.back();
+  unsigned kDim = dims.k.back();
+  std::string wgMName = makeVarName(kKnobWgPrefix, mDim);
+  std::string wgNName = makeVarName(kKnobWgPrefix, nDim);
+  std::string redKName = makeVarName(kKnobRedPrefix, kDim);
+  std::string sgMName = makeVarName(kKnobSgPrefix, mDim);
+  std::string sgNName = makeVarName(kKnobSgPrefix, nDim);
+  std::string mDimName = makeVarName(kLoopRangePrefix, mDim);
+  std::string nDimName = makeVarName(kLoopRangePrefix, nDim);
+  std::string kDimName = makeVarName(kLoopRangePrefix, kDim);
+
+  // Top-level knobs.
+  Value wgM = mkKnob(builder, loc, wgMName);
+  Value wgN = mkKnob(builder, loc, wgNName);
+  Value redK = mkKnob(builder, loc, redKName);
+  Value sgM = mkKnob(builder, loc, sgMName);
+  Value sgN = mkKnob(builder, loc, sgNName);
+  Value sgSize = mkKnob(builder, loc, kKnobSgSizeName);
+  Value wgSizeX = mkKnob(builder, loc, kKnobWgSizeXName);
+
+  // Derived MMA shape values: mma_m, mma_n, mma_k indexed by the mma_idx
+  // knob. Not in the knob dict, hence intentionally not declared via mkKnob.
+  auto [mmaMLookup, mmaNLookup, mmaKLookup] =
+      emitMMALookup(builder, loc, compatibleMMAs);
+
+  // Derived subgroup counts. Unlike VectorDistribute, the subgroup *count*
+  // along M/N is not a knob in TaF — it is recovered from the workgroup
+  // tile, the subgroup tile, and the MMA shape:
+  //   sg_m_cnt = wg_m / (sg_m * mma_m)
+  //   sg_n_cnt = wg_n / (sg_n * mma_n)
+  //   sg_num   = sg_m_cnt * sg_n_cnt
+  // The divisions are guarded by Constraint 4 (divisibility) below.
+  Value sgMDenom =
+      smt::IntMulOp::create(builder, loc, ValueRange{sgM, mmaMLookup});
+  Value sgNDenom =
+      smt::IntMulOp::create(builder, loc, ValueRange{sgN, mmaNLookup});
+  Value sgMCnt = smt::IntDivOp::create(builder, loc, wgM, sgMDenom);
+  Value sgNCnt = smt::IntDivOp::create(builder, loc, wgN, sgNDenom);
+  Value sgNum = smt::IntMulOp::create(builder, loc, ValueRange{sgMCnt, sgNCnt});
+  // sg_k: number of mma_k along K per subgroup. Since red_k is already in
+  // MMA-tile units (see element-space note above), sg_k == red_k.
+  Value sgK = redK;
+
+  // Constraint 0: sg_size pinned to the target's preferred subgroup size.
+  assertEq(builder, loc, sgSize, subgroupSizeVal,
+           "sg_size == preferred_subgroup_size");
+
+  // Important unit note for the K axis (matches the Python tuner at
+  // rocm_dispatch_constraints.py:343-358): `red_k` is in *MMA-tile units*,
+  // not elements. The element-space K tile is `red_k * mma_k`. wg_m / wg_n
+  // are in *elements* (lowering_config's workgroup field is element-sized
+  // per the TaF pipeline; subgroup-tile knobs `sg_m`/`sg_n` are in MMA-tile
+  // units, applied in constraints 4-7 below).
+  Value redKElements =
+      smt::IntMulOp::create(builder, loc, ValueRange{redK, mmaKLookup});
+
+  // Constraint 1: problem size divisible by tile.
+  assertDivisible(
+      builder, loc, smtDimArgs[mDim], wgM,
+      llvm::join_items("", mDimName, " must be divisible by ", wgMName));
+  assertDivisible(
+      builder, loc, smtDimArgs[nDim], wgN,
+      llvm::join_items("", nDimName, " must be divisible by ", wgNName));
+  assertDivisible(
+      builder, loc, smtDimArgs[kDim], redKElements,
+      llvm::join_items("", kDimName,
+                       " must be divisible by (", redKName, " * mma_k)"));
+
+  // Constraint 2: mma <= wg_tile <= dim (element-space for M/N), and
+  // wg_tile <= VGPR budget. For K, the comparable check is on the
+  // element-space size: mma_k <= red_k_elements <= dim_k.
+  assertBounds(builder, loc, wgM, wgMName, mmaMLookup, "mma_m",
+               smtDimArgs[mDim], mDimName);
+  assertBounds(builder, loc, wgN, wgNName, mmaNLookup, "mma_n",
+               smtDimArgs[nDim], nDimName);
+  assertCmp(builder, loc, smt::IntPredicate::le, redKElements,
+            smtDimArgs[kDim],
+            llvm::join_items("", "(", redKName, " * mma_k) <= ", kDimName));
+  // red_k itself is just a positive MMA-tile count.
+  assertCmp(builder, loc, smt::IntPredicate::ge, redK, oneVal,
+            llvm::join_items("", redKName, " >= 1"));
+  assertCmp(builder, loc, smt::IntPredicate::le, wgM, maxVGPRsVal,
+            llvm::join_items("", wgMName, " <= 512 (max VGPRs)"));
+  assertCmp(builder, loc, smt::IntPredicate::le, wgN, maxVGPRsVal,
+            llvm::join_items("", wgNName, " <= 512 (max VGPRs)"));
+  assertCmp(builder, loc, smt::IntPredicate::le, redKElements, maxVGPRsVal,
+            llvm::join_items("", "(", redKName,
+                             " * mma_k) <= 512 (max VGPRs)"));
+
+  // Constraint 3: wg_tile must be a whole multiple of the MMA shape so the
+  // intrinsic tiles cleanly. K is already in MMA-tile units, so no
+  // separate divisibility check is needed for it here.
+  assertDivisible(builder, loc, wgM, mmaMLookup,
+                  llvm::join_items("", wgMName, " must be divisible by mma_m"));
+  assertDivisible(builder, loc, wgN, mmaNLookup,
+                  llvm::join_items("", wgNName, " must be divisible by mma_n"));
+
+  // Constraint 4: subgroup tile cleanly partitions the workgroup tile.
+  //   wg_m % (sg_m * mma_m) == 0
+  //   wg_n % (sg_n * mma_n) == 0
+  // This is what makes the derived sg_m_cnt/sg_n_cnt exact integers.
+  assertDivisible(
+      builder, loc, wgM, sgMDenom,
+      llvm::join_items("", wgMName, " must be divisible by (", sgMName,
+                       " * mma_m)"));
+  assertDivisible(
+      builder, loc, wgN, sgNDenom,
+      llvm::join_items("", wgNName, " must be divisible by (", sgNName,
+                       " * mma_n)"));
+
+  // Constraint 5: subgroup tiles are positive.
+  assertCmp(builder, loc, smt::IntPredicate::ge, sgM, oneVal,
+            llvm::join_items("", sgMName, " >= 1"));
+  assertCmp(builder, loc, smt::IntPredicate::ge, sgN, oneVal,
+            llvm::join_items("", sgNName, " >= 1"));
+
+  // Constraint 6: derived subgroup counts in range.
+  // TODO(#23535): 32 = max(wg_tile)/min(mma) = 512/16; revisit with the
+  // VGPR-budget TODO above.
+  Value maxSgCntVal = mkIntConst(builder, loc, 32);
+  assertBounds(builder, loc, sgMCnt, "sg_m_cnt", oneVal, "1", maxSgCntVal,
+               "32");
+  assertBounds(builder, loc, sgNCnt, "sg_n_cnt", oneVal, "1", maxSgCntVal,
+               "32");
+  assertBounds(builder, loc, sgK, "sg_k", oneVal, "1", maxSgCntVal, "32");
+
+  // Constraint 7: sg_num pinned to the tuner's default num_subgroups=4
+  // (rocm_dispatch_constraints.py:387-389: when num_subgroups > 0 the
+  // Python tuner emits `subgroups == num_subgroups`, not the loose
+  // bounded form). Pinning here is what closes parity with the Python
+  // counter; without it the compiler accepts ~4x more candidates.
+  // TODO(#23535): expose num_subgroups as a search-space option (mirror
+  // the `num_subgroups <= 0` Python branch with `1 <= sg_num <= 10`).
+  Value numSubgroupsVal = mkIntConst(builder, loc, 4);
+  assertEq(builder, loc, sgNum, numSubgroupsVal, "sg_num == 4");
+
+  // Constraint 8: total thread count fits per-workgroup limit.
+  Value totalThreads =
+      smt::IntMulOp::create(builder, loc, ValueRange{sgNum, sgSize});
+  assertCmp(builder, loc, smt::IntPredicate::le, totalThreads, maxThreadsVal,
+            "total_threads <= max_threads");
+
+  // Constraint 9: wg_size_x derivation. y and z are pinned to 1 by the
+  // knob template, so only x needs an SMT-level equation.
+  assertEq(builder, loc, wgSizeX, totalThreads,
+           "wg_size_x == sg_num * sg_size");
+
+  // Constraint 10: shared memory budget.
+  //   bytes(lhs) * wg_m * red_k + bytes(rhs) * wg_n * red_k
+  //     <= max_workgroup_memory_bytes
+  // Approximate: ignores padding/double-buffering; matches the tuner's
+  // formula at rocm_dispatch_constraints.py:394-399.
+  int64_t lhsBytesPerElem = lhsBitWidth / 8;
+  int64_t rhsBytesPerElem = rhsBitWidth / 8;
+  Value lhsBytesVal = mkIntConst(builder, loc, lhsBytesPerElem);
+  Value rhsBytesVal = mkIntConst(builder, loc, rhsBytesPerElem);
+  // red_k is in MMA-tile units; use redKElements (= red_k * mma_k) for the
+  // byte-accurate footprint.
+  Value lhsSmemTerm =
+      smt::IntMulOp::create(builder, loc, ValueRange{lhsBytesVal, wgM, redKElements});
+  Value rhsSmemTerm =
+      smt::IntMulOp::create(builder, loc, ValueRange{rhsBytesVal, wgN, redKElements});
+  Value totalSmem =
+      smt::IntAddOp::create(builder, loc, ValueRange{lhsSmemTerm, rhsSmemTerm});
+  assertCmp(builder, loc, smt::IntPredicate::le, totalSmem, maxSharedMemVal,
+            "shared memory must fit in workgroup memory");
+
+  return success();
+}
+
+/// Emit constraints for a single root op under the TileAndFuse pipeline.
+/// v0: matmul (contraction) only. Convolution-on-TaF is deferred (#23535).
+static LogicalResult
+emitTileAndFuseConstraintsForOp(Operation *rootOp, RootOpAttr rootOpAttr) {
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(rootOp);
+  if (!linalgOp || !linalg::isaContractionOpInterface(linalgOp)) {
+    return success();
+  }
+
+  IREE::GPU::TargetAttr gpuTarget = getGPUTargetAttr(rootOp);
+  if (!gpuTarget) {
+    return success();
+  }
+
+  std::optional<RootOpLoopInfo> loopInfo = getRootOpLoopInfo(rootOp);
+  if (!loopInfo) {
+    return success();
+  }
+
+  FailureOr<ContractionLikeDims> dims = inferContractionLikeDims(linalgOp);
+  if (failed(dims)) {
+    return success();
+  }
+
+  SmallVector<Attribute> compatibleMMAs =
+      getCompatibleMMAAttrs(linalgOp, gpuTarget, *loopInfo, *dims);
+  if (compatibleMMAs.empty()) {
+    return success();
+  }
+
+  MLIRContext *ctx = rootOp->getContext();
+  OpBuilder builder(ctx);
+  DictionaryAttr knobs =
+      buildTileAndFuseKnobsDict(ctx, *loopInfo, *dims, compatibleMMAs);
+  auto pipelineAttr = IREE::GPU::PipelineAttr::get(
+      ctx, IREE::GPU::LoweringPipeline::TileAndFuse);
+  ConstraintsOpShell shell =
+      createConstraintsOpShell(builder, rootOp, rootOpAttr, pipelineAttr, knobs,
+                               loopInfo->numLoops, loopInfo->indexingMaps);
+
+  return emitTileAndFuseConstraints(builder, linalgOp, *dims, gpuTarget,
+                                    shell.smtDimArgs, compatibleMMAs);
+}
+
 /// Multiple root ops may be present in a set, e.g. <set = 0>:
 /// [linalg.fill, linalg.matmul]. This function will choose the matmul op
 /// over the fill op.
@@ -633,13 +997,15 @@ LogicalResult emitLLVMGPUConstraints(Attribute attr,
 
   auto gpuPipelineAttr = cast<IREE::GPU::PipelineAttr>(attr);
 
-  // Only VectorDistribute has constraint generation today.
-  if (gpuPipelineAttr.getValue() !=
-      IREE::GPU::LoweringPipeline::VectorDistribute) {
+  switch (gpuPipelineAttr.getValue()) {
+  case IREE::GPU::LoweringPipeline::VectorDistribute:
+    return emitVectorDistributeConstraintsForOp(tunableOp, opAttr);
+  case IREE::GPU::LoweringPipeline::TileAndFuse:
+    return emitTileAndFuseConstraintsForOp(tunableOp, opAttr);
+  default:
+    // Other pipelines do not have constraint generation yet.
     return success();
   }
-
-  return emitVectorDistributeConstraintsForOp(tunableOp, opAttr);
 }
 
 } // namespace mlir::iree_compiler

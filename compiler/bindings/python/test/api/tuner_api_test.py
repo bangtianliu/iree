@@ -804,3 +804,73 @@ def test_materialize_compilation_info_error_diagnostic():
         assert False, "expected missing wg_0 assignment to fail"
     except RuntimeError as e:
         assert "missing assignment for knob 'wg_0'" in str(e)
+
+
+# Round-trip for the TileAndFuse knob dict shape (mirrors what the IREE
+# compiler emits via emitTileAndFuseConstraintsForOp). Locks in the
+# generic materializer's handling of the TaF-specific fields: `subgroup`
+# (per-loop tile size knobs), `promote_operands` (fixed array), and a
+# 1D `workgroup_size` template.
+_MATERIALIZE_TAF_CONSTRAINTS_MODULE = """
+    module {
+        iree_codegen.smt.constraints
+            target = <set = 0>,
+            pipeline = #iree_gpu.pipeline<TileAndFuse>,
+            knobs = {
+                workgroup = [#iree_codegen.smt.int_knob<"wg_0">,
+                             #iree_codegen.smt.int_knob<"wg_1">, 0],
+                reduction = [0, 0, #iree_codegen.smt.int_knob<"red_2">],
+                subgroup = [#iree_codegen.smt.int_knob<"sg_0">,
+                            #iree_codegen.smt.int_knob<"sg_1">, 0],
+                mma_kind = #iree_codegen.smt.one_of_knob<"mma_idx",
+                    [#iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>]>,
+                promote_operands = [0, 1],
+                workgroup_size = [#iree_codegen.smt.int_knob<"wg_size_x">, 1, 1],
+                subgroup_size = #iree_codegen.smt.int_knob<"sg_size">
+            }
+            dims() {
+            }
+    }
+"""
+
+
+@run
+def test_materialize_compilation_info_tile_and_fuse():
+    input_module = ir.Module.parse(_MATERIALIZE_TAF_CONSTRAINTS_MODULE)
+    constraints_ops = ir.get_ops_of_type(input_module, iree_codegen.ConstraintsOp)
+    assert len(constraints_ops) == 1
+    constraints_op = constraints_ops[0]
+
+    compilation_info = iree_codegen.materialize_compilation_info(
+        constraints_op,
+        {
+            "wg_0": 32,
+            "wg_1": 64,
+            "red_2": 16,
+            "sg_0": 2,
+            "sg_1": 4,
+            "mma_idx": 0,
+            "wg_size_x": 64,
+            "sg_size": 64,
+        },
+    )
+    assert isinstance(compilation_info, iree_codegen.CompilationInfoAttr)
+    config_str = str(compilation_info.lowering_config)
+    # The materializer should produce a TaF-shaped lowering_config with all
+    # six lowering fields present. Order inside the printed dict is
+    # alphabetical, so spot-check individual entries rather than the full
+    # serialized form.
+    assert "workgroup = [32, 64, 0]" in config_str, config_str
+    assert "reduction = [0, 0, 16]" in config_str, config_str
+    assert "subgroup = [2, 4, 0]" in config_str, config_str
+    assert "promote_operands = [0, 1]" in config_str, config_str
+    assert (
+        "mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>" in config_str
+    ), config_str
+
+    translation_info = iree_codegen.TranslationInfoAttr(
+        compilation_info.translation_info
+    )
+    assert list(translation_info.workgroup_size) == [64, 1, 1]
+    assert translation_info.subgroup_size == 64
+    assert str(translation_info.pass_pipeline) == "#iree_gpu.pipeline<TileAndFuse>"

@@ -50,6 +50,7 @@ func.func @matmul_and_fill() attributes {hal.executable.target = #exec_target} {
 // CHECK-NOT:   iree_codegen.smt.constraints
 // CHECK-NOT:   knobs
 // CHECK:       linalg.matmul {{.+}} #iree_codegen.root_op<set = [[SET:[0-9]+]]>
+// CHECK:       iree_codegen.smt.constraints target = <set = [[SET]]>, pipeline = #iree_gpu.pipeline<TileAndFuse>,
 // CHECK:       iree_codegen.smt.constraints target = <set = [[SET]]>, pipeline = #iree_gpu.pipeline<VectorDistribute>,
 // CHECK-NEXT:  knobs = {
 // CHECK-DAG:   mma_kind = #iree_codegen.smt.one_of_knob<"mma_idx", [#iree_gpu.mma_layout<MFMA_F32_16x16x4_F32>]>
@@ -152,6 +153,7 @@ func.func @expanded_matmul()
 
 // CHECK-LABEL: func.func @expanded_matmul
 // CHECK:       linalg.generic
+// CHECK:       iree_codegen.smt.constraints target = <set = 0>, pipeline = #iree_gpu.pipeline<TileAndFuse>,
 // CHECK:       iree_codegen.smt.constraints target = <set = 0>, pipeline = #iree_gpu.pipeline<VectorDistribute>,
 // CHECK-NEXT:  knobs = {
 // CHECK-DAG:   mma_kind = #iree_codegen.smt.one_of_knob<"mma_idx", [#iree_gpu.mma_layout<MFMA_F32_16x16x4_F32>]>
@@ -288,6 +290,7 @@ func.func @matmul_with_multiple_compatible_mmas()
 
 // CHECK-LABEL: func.func @matmul_with_multiple_compatible_mmas
 // CHECK:       linalg.matmul {{.+}} #iree_codegen.root_op<set = 0>
+// CHECK:       iree_codegen.smt.constraints target = <set = 0>, pipeline = #iree_gpu.pipeline<TileAndFuse>,
 // CHECK:       iree_codegen.smt.constraints target = <set = 0>, pipeline = #iree_gpu.pipeline<VectorDistribute>,
 // CHECK:       mma_kind = #iree_codegen.smt.one_of_knob<"mma_idx", [#iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>, #iree_gpu.mma_layout<MFMA_F32_32x32x8_F16>]>
 
@@ -304,6 +307,7 @@ func.func @matmul_with_duplicate_mmas_deduped()
 
 // CHECK-LABEL: func.func @matmul_with_duplicate_mmas_deduped
 // CHECK:       linalg.matmul {{.+}} #iree_codegen.root_op<set = 1>
+// CHECK:       iree_codegen.smt.constraints target = <set = 1>, pipeline = #iree_gpu.pipeline<TileAndFuse>,
 // CHECK:       iree_codegen.smt.constraints target = <set = 1>, pipeline = #iree_gpu.pipeline<VectorDistribute>,
 // CHECK:       mma_kind = #iree_codegen.smt.one_of_knob<"mma_idx", [#iree_gpu.mma_layout<MFMA_F32_16x16x4_F32>]>
 
@@ -338,6 +342,7 @@ func.func @matmul_with_block_intrinsic_filtered()
 
 // CHECK-LABEL: func.func @matmul_with_block_intrinsic_filtered
 // CHECK:       linalg.matmul {{.+}} #iree_codegen.root_op<set = 0>
+// CHECK:       iree_codegen.smt.constraints target = <set = 0>, pipeline = #iree_gpu.pipeline<TileAndFuse>,
 // CHECK:       iree_codegen.smt.constraints target = <set = 0>, pipeline = #iree_gpu.pipeline<VectorDistribute>,
 // CHECK:       mma_kind = #iree_codegen.smt.one_of_knob<"mma_idx", [#iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>]>
 // CHECK-NOT:   MFMA_F32_4x4x4x16B_F16
